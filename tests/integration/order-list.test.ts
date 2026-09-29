@@ -130,6 +130,8 @@ describe("order list extraction (integration)", () => {
         "Huggies Little Snugglers Diapers Size 2, 186 Count (3 Packs of 62)",
         "Frida for Kids Fluoride Toothpaste for Kids, Cavity Protection, 4 oz",
       ]);
+      // Item count is derived from the titles, not a separate heuristic
+      expect(headers[0].itemCount).toBe(2);
     });
   });
 });
