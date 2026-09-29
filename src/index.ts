@@ -157,7 +157,7 @@ const tools: Tool[] = [
   {
     name: "get_amazon_orders",
     description:
-      "Fetch Amazon order history for a specified date range or year. Returns order summaries including: order ID, date, total amount, status, item count, shipping address (7 lines), payment method, and Subscribe & Save frequency. Optionally includes detailed item data (ASIN, name, price, quantity, seller, condition) and shipment tracking. Use for browsing order history or building reports.",
+      "Fetch Amazon order history for a specified date range or year. Returns order summaries including: order ID, date, total amount, status, item count, item titles (product names shown on the order card), shipping address (7 lines), payment method, and Subscribe & Save frequency. Optionally includes detailed item data (ASIN, name, price, quantity, seller, condition) and shipment tracking. Use for browsing order history or building reports.",
     inputSchema: {
       type: "object",
       properties: {

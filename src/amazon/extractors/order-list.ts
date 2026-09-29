@@ -571,6 +571,35 @@ async function extractItemCount(
 }
 
 /**
+ * Extract item titles from order card.
+ * The order list page renders one [data-component="itemTitle"] element per
+ * item (the same selector used to count items), so titles are available
+ * without visiting each order's invoice page.
+ */
+async function extractItemTitles(
+  card: import("playwright").Locator,
+): Promise<string[]> {
+  try {
+    const titleEls = card.locator('[data-component="itemTitle"]');
+    const count = await titleEls.count().catch(() => 0);
+    const titles: string[] = [];
+    for (let i = 0; i < count; i++) {
+      const raw = await titleEls
+        .nth(i)
+        .textContent({ timeout: 300 })
+        .catch(() => "");
+      const cleaned = cleanText(raw || "");
+      if (cleaned && !titles.includes(cleaned)) {
+        titles.push(cleaned);
+      }
+    }
+    return titles;
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Extract Subscribe & Save frequency from order card.
  * Looks for text like "Auto-delivered: Every 1 month"
  */
@@ -849,6 +878,7 @@ export async function extractOrderHeaders(
         paymentMethod,
         chargeSummary,
         itemCount,
+        itemTitles,
         subscribeAndSave,
       ] = await Promise.all([
         extractOrderStatus(card, text),
@@ -856,6 +886,7 @@ export async function extractOrderHeaders(
         extractPaymentMethod(card),
         extractChargeSummary(card, currency),
         extractItemCount(card),
+        extractItemTitles(card),
         extractSubscribeAndSave(card, text),
       ]);
 
@@ -879,6 +910,7 @@ export async function extractOrderHeaders(
         promotion: chargeSummary.promotion,
         grandTotal: chargeSummary.grandTotal,
         itemCount,
+        itemTitles,
         subscribeAndSave,
       });
 
