@@ -542,6 +542,26 @@ export async function fetchOrders(
           break;
         }
 
+        // Date-bounded early termination: order list pages are
+        // reverse-chronological, so once the newest order on a page is older
+        // than startDate, no later page can contain in-range orders. Stop
+        // paginating instead of crawling the rest of the year.
+        if (isDateBounded && parsedStartDate && pageHeaders.length > 0) {
+          let newestOnPage: number | null = null;
+          for (const header of pageHeaders) {
+            if (header.date && !Number.isNaN(header.date.getTime())) {
+              const v = dateValue(header.date);
+              newestOnPage = newestOnPage === null ? v : Math.max(newestOnPage, v);
+            }
+          }
+          if (newestOnPage !== null && newestOnPage < parsedStartDate.value) {
+            console.error(
+              `[fetch-orders] Page ${pageNum} is entirely older than start date; stopping pagination.`,
+            );
+            break;
+          }
+        }
+
         hasMore = await hasNextPage(page);
         console.error(`[fetch-orders] Has next page: ${hasMore}`);
         if (hasMore) {
