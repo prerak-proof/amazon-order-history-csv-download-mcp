@@ -834,6 +834,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     status: o.status?.label || "Unknown",
                     // Use itemCount from order header (extracted from list page) or fall back to items array length
                     itemCount: o.itemCount ?? o.items?.length ?? 0,
+                    // Item titles captured from the order list page (no invoice visit needed)
+                    itemTitles: o.itemTitles,
                     shipmentCount: o.shipments?.length || 0,
                     // Enhanced order header data from list page
                     subtotal: o.subtotal,
