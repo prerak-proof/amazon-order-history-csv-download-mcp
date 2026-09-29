@@ -574,28 +574,52 @@ async function extractItemCount(
  * Extract item titles from order card.
  * The order list page renders one [data-component="itemTitle"] element per
  * item (the same selector used to count items), so titles are available
- * without visiting each order's invoice page.
+ * without visiting each order's invoice page. Newer amazon.com layouts drop
+ * the data-component attributes; there each item renders an image link
+ * (tabindex="-1") and a title link, both pointing at /dp/<ASIN>, so fall
+ * back to the non-image /dp/ links.
  */
 async function extractItemTitles(
   card: import("playwright").Locator,
 ): Promise<string[]> {
+  const titles: string[] = [];
+  const pushTitle = (raw: string | null) => {
+    const cleaned = cleanText(raw || "");
+    if (cleaned && !titles.includes(cleaned)) {
+      titles.push(cleaned);
+    }
+  };
   try {
+    // Strategy 1: data-component="itemTitle" elements (older layout)
     const titleEls = card.locator('[data-component="itemTitle"]');
     const count = await titleEls.count().catch(() => 0);
-    const titles: string[] = [];
     for (let i = 0; i < count; i++) {
-      const raw = await titleEls
-        .nth(i)
-        .textContent({ timeout: 300 })
-        .catch(() => "");
-      const cleaned = cleanText(raw || "");
-      if (cleaned && !titles.includes(cleaned)) {
-        titles.push(cleaned);
-      }
+      pushTitle(
+        await titleEls
+          .nth(i)
+          .textContent({ timeout: 300 })
+          .catch(() => ""),
+      );
+    }
+    if (titles.length > 0) {
+      return titles;
+    }
+    // Strategy 2: product title links (current amazon.com layout).
+    // Each item has an image link (tabindex="-1", title in the img alt)
+    // and a title link; only the title link carries the visible name.
+    const linkEls = card.locator('a[href*="/dp/"]:not([tabindex="-1"])');
+    const linkCount = await linkEls.count().catch(() => 0);
+    for (let i = 0; i < linkCount; i++) {
+      pushTitle(
+        await linkEls
+          .nth(i)
+          .textContent({ timeout: 300 })
+          .catch(() => ""),
+      );
     }
     return titles;
   } catch {
-    return [];
+    return titles;
   }
 }
 

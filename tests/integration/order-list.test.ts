@@ -6,6 +6,7 @@
 import { chromium, Browser, Page } from "playwright";
 import { readFileSync } from "fs";
 import { join } from "path";
+import { extractOrderHeaders } from "../../src/amazon/extractors/order-list";
 
 // Note: Integration tests require Playwright and are skipped in CI without browsers
 describe("order list extraction (integration)", () => {
@@ -102,6 +103,33 @@ describe("order list extraction (integration)", () => {
 
       // Check Subscribe & Save
       expect(dateText).toContain("Auto-delivered: Every 1 month");
+    });
+  });
+
+  describe("US order card with title links (current layout)", () => {
+    it("extracts item titles from /dp/ title links without data-component attributes", async () => {
+      if (!browser) {
+        return; // Skip if no browser
+      }
+
+      const fixtureHtml = readFileSync(
+        join(__dirname, "fixtures/order-card-us-title-links.html"),
+        "utf-8",
+      );
+
+      await page.setContent(
+        `<!DOCTYPE html><html><body>${fixtureHtml}</body></html>`,
+      );
+
+      const headers = await extractOrderHeaders(page, "us");
+      expect(headers).toHaveLength(1);
+      expect(headers[0].id).toBe("111-2223333-4445556");
+      // Titles come from the visible title links, not the image links
+      // (tabindex="-1"), and are deduplicated
+      expect(headers[0].itemTitles).toEqual([
+        "Huggies Little Snugglers Diapers Size 2, 186 Count (3 Packs of 62)",
+        "Frida for Kids Fluoride Toothpaste for Kids, Cavity Protection, 4 oz",
+      ]);
     });
   });
 });
