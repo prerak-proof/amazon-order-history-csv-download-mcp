@@ -836,7 +836,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                     itemCount: o.itemCount ?? o.items?.length ?? 0,
                     // Item titles captured from the order list page (no invoice visit needed)
                     itemTitles: o.itemTitles,
-                    shipmentCount: o.shipments?.length || 0,
+                    // Shipment count from the list page; falls back to fetched shipments
+                    shipmentCount: o.shipmentCount ?? o.shipments?.length ?? 0,
                     // Enhanced order header data from list page
                     subtotal: o.subtotal,
                     shipping: o.shipping,

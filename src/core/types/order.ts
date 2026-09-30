@@ -137,6 +137,10 @@ export interface OrderHeader {
   // no invoice-page visit required)
   itemTitles?: string[];
 
+  // Shipment count (from order list page - number of delivery status boxes
+  // on the card, no detail-page visit required)
+  shipmentCount?: number;
+
   // Subscribe & Save frequency (e.g., "Every 1 month")
   subscribeAndSave?: string;
 }

@@ -132,6 +132,8 @@ describe("order list extraction (integration)", () => {
       ]);
       // Item count is derived from the titles, not a separate heuristic
       expect(headers[0].itemCount).toBe(2);
+      // Shipment count is the number of delivery status boxes on the card
+      expect(headers[0].shipmentCount).toBe(2);
     });
   });
 });

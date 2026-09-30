@@ -505,6 +505,25 @@ async function extractPaymentMethod(
 }
 
 /**
+ * Count shipments on the order card.
+ * Each shipment group renders its own .delivery-box__primary-text status
+ * line (e.g. "Delivered today", "Arriving Thursday"), so the number of
+ * those elements is the shipment count. No detail-page visit required.
+ */
+async function extractShipmentCount(
+  card: import("playwright").Locator,
+): Promise<number> {
+  try {
+    return await card
+      .locator(".delivery-box__primary-text")
+      .count()
+      .catch(() => 0);
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * Extract item titles from order card.
  * The order list page renders one [data-component="itemTitle"] element per
  * item (the same selector used to count items), so titles are available
@@ -836,6 +855,7 @@ export async function extractOrderHeaders(
         paymentMethod,
         chargeSummary,
         itemTitles,
+        shipmentCount,
         subscribeAndSave,
       ] = await Promise.all([
         extractOrderStatus(card, text),
@@ -843,6 +863,7 @@ export async function extractOrderHeaders(
         extractPaymentMethod(card),
         extractChargeSummary(card, currency),
         extractItemTitles(card),
+        extractShipmentCount(card),
         extractSubscribeAndSave(card, text),
       ]);
 
@@ -870,6 +891,9 @@ export async function extractOrderHeaders(
         // titles actually extracted, so the titles are the source of truth.
         itemCount: itemTitles.length,
         itemTitles,
+        // Shipment count from the list page; falls back to detail-page
+        // shipments when they were fetched.
+        shipmentCount,
         subscribeAndSave,
       });
 
