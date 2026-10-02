@@ -505,68 +505,74 @@ async function extractPaymentMethod(
 }
 
 /**
- * Extract item count from order card.
- * Counts the number of items displayed on the card using container-based strategies.
- * Avoids counting "Buy it again" buttons or duplicate links.
+ * Count shipments on the order card.
+ * Each shipment group renders its own .delivery-box__primary-text status
+ * line (e.g. "Delivered today", "Arriving Thursday"), so the number of
+ * those elements is the shipment count. No detail-page visit required.
  */
-async function extractItemCount(
+async function extractShipmentCount(
   card: import("playwright").Locator,
 ): Promise<number> {
   try {
-    // Strategy 1: data-component="purchasedItems" (modern layout 2024+)
-    // This is the most reliable - each purchasedItems component = 1 item
-    const purchasedItems = card.locator('[data-component="purchasedItems"]');
-    const purchasedCount = await purchasedItems.count().catch(() => 0);
-    if (purchasedCount > 0) {
-      debug(
-        `[extractItemCount] Found ${purchasedCount} via data-component="purchasedItems"`,
+    return await card
+      .locator(".delivery-box__primary-text")
+      .count()
+      .catch(() => 0);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Extract item titles from order card.
+ * The order list page renders one [data-component="itemTitle"] element per
+ * item (the same selector used to count items), so titles are available
+ * without visiting each order's invoice page. Newer amazon.com layouts drop
+ * the data-component attributes; there each item renders an image link
+ * (tabindex="-1") and a title link, both pointing at /dp/<ASIN>, so fall
+ * back to the non-image /dp/ links.
+ */
+async function extractItemTitles(
+  card: import("playwright").Locator,
+): Promise<string[]> {
+  const titles: string[] = [];
+  const pushTitle = (raw: string | null) => {
+    const cleaned = cleanText(raw || "");
+    if (cleaned && !titles.includes(cleaned)) {
+      titles.push(cleaned);
+    }
+  };
+  try {
+    // Strategy 1: data-component="itemTitle" elements (older layout)
+    const titleEls = card.locator('[data-component="itemTitle"]');
+    const count = await titleEls.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      pushTitle(
+        await titleEls
+          .nth(i)
+          .textContent({ timeout: 300 })
+          .catch(() => ""),
       );
-      return purchasedCount;
     }
-
-    // Strategy 2: Item title components (one per item)
-    const itemTitles = card.locator('[data-component="itemTitle"]');
-    const titleCount = await itemTitles.count().catch(() => 0);
-    if (titleCount > 0) {
-      debug(`[extractItemCount] Found ${titleCount} via itemTitle components`);
-      return titleCount;
+    if (titles.length > 0) {
+      return titles;
     }
-
-    // Strategy 3: Item image containers (yohtmlc-item class)
-    // Each item has its own container with image
-    const itemContainers = card.locator(
-      ".yohtmlc-item, .a-fixed-left-grid-inner",
-    );
-    const containerCount = await itemContainers.count().catch(() => 0);
-    if (containerCount > 0) {
-      debug(`[extractItemCount] Found ${containerCount} via item containers`);
-      return containerCount;
+    // Strategy 2: product title links (current amazon.com layout).
+    // Each item has an image link (tabindex="-1", title in the img alt)
+    // and a title link; only the title link carries the visible name.
+    const linkEls = card.locator('a[href*="/dp/"]:not([tabindex="-1"])');
+    const linkCount = await linkEls.count().catch(() => 0);
+    for (let i = 0; i < linkCount; i++) {
+      pushTitle(
+        await linkEls
+          .nth(i)
+          .textContent({ timeout: 300 })
+          .catch(() => ""),
+      );
     }
-
-    // Strategy 4: Shipment item containers
-    const shipmentItems = card.locator(".shipment-item");
-    const shipmentCount = await shipmentItems.count().catch(() => 0);
-    if (shipmentCount > 0) {
-      debug(`[extractItemCount] Found ${shipmentCount} via shipment-item`);
-      return shipmentCount;
-    }
-
-    // Strategy 5: Product images in the item display area (not in buttons)
-    // Look for images that are direct children of item containers, not in action areas
-    const productImages = card.locator(
-      '.yohtmlc-item img[src*="images-amazon"], .a-fixed-left-grid-col img[src*="images-amazon"]',
-    );
-    const imgCount = await productImages.count().catch(() => 0);
-    if (imgCount > 0) {
-      debug(`[extractItemCount] Found ${imgCount} via product images`);
-      return imgCount;
-    }
-
-    debug(`[extractItemCount] No items found with any strategy`);
-    return 0;
-  } catch (e) {
-    debug(`[extractItemCount] Error: ${e}`);
-    return 0;
+    return titles;
+  } catch {
+    return titles;
   }
 }
 
@@ -848,14 +854,16 @@ export async function extractOrderHeaders(
         shippingAddress,
         paymentMethod,
         chargeSummary,
-        itemCount,
+        itemTitles,
+        shipmentCount,
         subscribeAndSave,
       ] = await Promise.all([
         extractOrderStatus(card, text),
         extractShippingAddress(card),
         extractPaymentMethod(card),
         extractChargeSummary(card, currency),
-        extractItemCount(card),
+        extractItemTitles(card),
+        extractShipmentCount(card),
         extractSubscribeAndSave(card, text),
       ]);
 
@@ -878,7 +886,14 @@ export async function extractOrderHeaders(
         vat: chargeSummary.vat,
         promotion: chargeSummary.promotion,
         grandTotal: chargeSummary.grandTotal,
-        itemCount,
+        // Item count is the number of distinct titles on the card; a
+        // separate container-counting heuristic can disagree with the
+        // titles actually extracted, so the titles are the source of truth.
+        itemCount: itemTitles.length,
+        itemTitles,
+        // Shipment count from the list page; falls back to detail-page
+        // shipments when they were fetched.
+        shipmentCount,
         subscribeAndSave,
       });
 
