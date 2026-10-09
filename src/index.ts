@@ -10,11 +10,13 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
+  CallToolRequest,
   ListToolsRequestSchema,
   Tool,
   ProgressNotification,
 } from "@modelcontextprotocol/sdk/types.js";
 import { chromium, BrowserContext, Page } from "playwright";
+import { z } from "zod";
 import { isAbsolute, join } from "path";
 import { homedir } from "os";
 import packageMetadata from "../package.json";
@@ -46,6 +48,58 @@ const amazonPlugin = new AmazonPlugin();
 // Browser context instance (lazy initialized)
 let browserContext: BrowserContext | null = null;
 let page: Page | null = null;
+let browserClosing: Promise<void> | null = null;
+let browserIdleTimer: ReturnType<typeof setTimeout> | null = null;
+let activeBrowserRequests = 0;
+const browserIdleTimeoutSetting = z.coerce.number().int().min(0).max(2147483647)
+  .safeParse(process.env.AMAZON_BROWSER_IDLE_TIMEOUT_MS ?? "300000");
+if (!browserIdleTimeoutSetting.success) {
+  throw new Error(
+    "AMAZON_BROWSER_IDLE_TIMEOUT_MS must be an integer between 0 and 2147483647 (0 disables idle closing)",
+  );
+}
+const browserIdleTimeoutMs = browserIdleTimeoutSetting.data;
+
+function clearBrowserIdleTimer(): void {
+  if (browserIdleTimer !== null) {
+    clearTimeout(browserIdleTimer);
+    browserIdleTimer = null;
+  }
+}
+
+function scheduleBrowserIdleClose(): void {
+  clearBrowserIdleTimer();
+  if (
+    browserIdleTimeoutMs === 0 || activeBrowserRequests > 0 ||
+    !browserContext || browserClosing
+  ) return;
+
+  const context = browserContext;
+  browserIdleTimer = setTimeout(() => {
+    browserIdleTimer = null;
+    if (activeBrowserRequests > 0 || browserContext !== context) return;
+    // Publish the closing promise before calling close, so new requests wait
+    // until Chromium releases the persistent profile before reopening it.
+    browserClosing = Promise.resolve()
+      .then(() => context.close())
+      .then(() => {
+        if (browserContext === context) {
+          browserContext = null;
+          page = null;
+        }
+        console.error("[browser] Closed Chromium after " + browserIdleTimeoutMs + " ms idle");
+      })
+      .catch((error) => {
+        console.error("[browser] Idle close failed:", error);
+      })
+      .finally(() => {
+        browserClosing = null;
+        // Retry later if closing failed and the context is still open.
+        scheduleBrowserIdleClose();
+      });
+  }, browserIdleTimeoutMs);
+  browserIdleTimer.unref();
+}
 
 // Browser data directory for session persistence.
 // Env var AMAZON_ORDERS_BROWSER_DATA_DIR overrides — required for multi-tenant
@@ -778,6 +832,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  activeBrowserRequests += 1;
+  clearBrowserIdleTimer();
+  try {
+    await browserClosing;
+    return await handleToolCall(request);
+  } finally {
+    activeBrowserRequests -= 1;
+    scheduleBrowserIdleClose();
+  }
+});
+
+async function handleToolCall(request: CallToolRequest): Promise<{
+  content: Array<{ type: string; text: string }>;
+  isError?: boolean;
+}> {
   const { name, arguments: args } = request.params;
 
   try {
@@ -1563,7 +1632,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
-});
+}
 
 // Cleanup on exit
 process.on("SIGINT", async () => {
