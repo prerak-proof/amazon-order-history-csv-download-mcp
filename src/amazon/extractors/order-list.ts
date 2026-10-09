@@ -524,55 +524,96 @@ async function extractShipmentCount(
 }
 
 /**
- * Extract item titles from order card.
- * The order list page renders one [data-component="itemTitle"] element per
- * item (the same selector used to count items), so titles are available
- * without visiting each order's invoice page. Newer amazon.com layouts drop
- * the data-component attributes; there each item renders an image link
- * (tabindex="-1") and a title link, both pointing at /dp/<ASIN>, so fall
- * back to the non-image /dp/ links.
+ * One item shown on an order card: its title plus the purchased quantity.
  */
-async function extractItemTitles(
+interface ExtractedItem {
+  title: string;
+  quantity: number;
+}
+
+/**
+ * Extract items (title + quantity) from order card.
+ * The order list page renders one [data-component="itemTitle"] element per
+ * item, so titles are available without visiting each order's invoice page.
+ * Newer amazon.com layouts drop the data-component attributes; there each
+ * item renders an image link (tabindex="-1") and a title link, both pointing
+ * at /dp/<ASIN>, so fall back to the non-image /dp/ links. The purchased
+ * quantity renders as a badge over the product image
+ * (span.product-image__qty); absent means 1.
+ */
+async function extractItems(
   card: import("playwright").Locator,
-): Promise<string[]> {
-  const titles: string[] = [];
-  const pushTitle = (raw: string | null) => {
+): Promise<ExtractedItem[]> {
+  const items: ExtractedItem[] = [];
+  const pushItem = (raw: string | null, quantity: number) => {
     const cleaned = cleanText(raw || "");
-    if (cleaned && !titles.includes(cleaned)) {
-      titles.push(cleaned);
+    if (cleaned && !items.some((i) => i.title === cleaned)) {
+      items.push({ title: cleaned, quantity });
     }
+  };
+  const readQuantity = async (
+    scope: import("playwright").Locator,
+  ): Promise<number> => {
+    const qtyEl = scope.locator(".product-image__qty").first();
+    if ((await qtyEl.count().catch(() => 0)) === 0) {
+      return 1;
+    }
+    const qtyText = (
+      (await qtyEl.textContent({ timeout: 300 }).catch(() => "")) || ""
+    ).trim();
+    const parsed = parseInt(qtyText, 10);
+    return !isNaN(parsed) && parsed > 0 ? parsed : 1;
   };
   try {
     // Strategy 1: data-component="itemTitle" elements (older layout)
     const titleEls = card.locator('[data-component="itemTitle"]');
     const count = await titleEls.count().catch(() => 0);
     for (let i = 0; i < count; i++) {
-      pushTitle(
+      pushItem(
         await titleEls
           .nth(i)
           .textContent({ timeout: 300 })
           .catch(() => ""),
+        1,
       );
     }
-    if (titles.length > 0) {
-      return titles;
+    if (items.length > 0) {
+      return items;
     }
-    // Strategy 2: product title links (current amazon.com layout).
-    // Each item has an image link (tabindex="-1", title in the img alt)
-    // and a title link; only the title link carries the visible name.
+    // Strategy 2: item boxes (current amazon.com layout). Each
+    // .a-fixed-left-grid-inner holds one item: title link on the right,
+    // quantity badge over the product image on the left.
+    const boxes = card.locator(".a-fixed-left-grid-inner");
+    const boxCount = await boxes.count().catch(() => 0);
+    for (let i = 0; i < boxCount; i++) {
+      const box = boxes.nth(i);
+      const link = box.locator('a[href*="/dp/"]:not([tabindex="-1"])').first();
+      if ((await link.count().catch(() => 0)) === 0) {
+        continue;
+      }
+      pushItem(
+        await link.textContent({ timeout: 300 }).catch(() => ""),
+        await readQuantity(box),
+      );
+    }
+    if (items.length > 0) {
+      return items;
+    }
+    // Strategy 3: bare product title links (fallback, quantity unknown)
     const linkEls = card.locator('a[href*="/dp/"]:not([tabindex="-1"])');
     const linkCount = await linkEls.count().catch(() => 0);
     for (let i = 0; i < linkCount; i++) {
-      pushTitle(
+      pushItem(
         await linkEls
           .nth(i)
           .textContent({ timeout: 300 })
           .catch(() => ""),
+        1,
       );
     }
-    return titles;
+    return items;
   } catch {
-    return titles;
+    return items;
   }
 }
 
@@ -854,7 +895,7 @@ export async function extractOrderHeaders(
         shippingAddress,
         paymentMethod,
         chargeSummary,
-        itemTitles,
+        items,
         shipmentCount,
         subscribeAndSave,
       ] = await Promise.all([
@@ -862,10 +903,12 @@ export async function extractOrderHeaders(
         extractShippingAddress(card),
         extractPaymentMethod(card),
         extractChargeSummary(card, currency),
-        extractItemTitles(card),
+        extractItems(card),
         extractShipmentCount(card),
         extractSubscribeAndSave(card, text),
       ]);
+      const itemTitles = items.map((i) => i.title);
+      const itemQuantities = items.map((i) => i.quantity);
 
       headers.push({
         id,
@@ -891,6 +934,9 @@ export async function extractOrderHeaders(
         // titles actually extracted, so the titles are the source of truth.
         itemCount: itemTitles.length,
         itemTitles,
+        // Per-item quantities parallel to itemTitles (from the quantity
+        // badge on the card; 1 when the badge is absent).
+        itemQuantities,
         // Shipment count from the list page; falls back to detail-page
         // shipments when they were fetched.
         shipmentCount,

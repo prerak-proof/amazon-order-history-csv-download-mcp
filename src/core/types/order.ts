@@ -137,6 +137,10 @@ export interface OrderHeader {
   // no invoice-page visit required)
   itemTitles?: string[];
 
+  // Per-item quantities, parallel to itemTitles (from the quantity badge on
+  // the card; 1 when the badge is absent)
+  itemQuantities?: number[];
+
   // Shipment count (from order list page - number of delivery status boxes
   // on the card, no detail-page visit required)
   shipmentCount?: number;

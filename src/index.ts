@@ -10,13 +10,11 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   CallToolRequestSchema,
-  CallToolRequest,
   ListToolsRequestSchema,
   Tool,
   ProgressNotification,
 } from "@modelcontextprotocol/sdk/types.js";
 import { chromium, BrowserContext, Page } from "playwright";
-import { z } from "zod";
 import { isAbsolute, join } from "path";
 import { homedir } from "os";
 import packageMetadata from "../package.json";
@@ -48,58 +46,6 @@ const amazonPlugin = new AmazonPlugin();
 // Browser context instance (lazy initialized)
 let browserContext: BrowserContext | null = null;
 let page: Page | null = null;
-let browserClosing: Promise<void> | null = null;
-let browserIdleTimer: ReturnType<typeof setTimeout> | null = null;
-let activeBrowserRequests = 0;
-const browserIdleTimeoutSetting = z.coerce.number().int().min(0).max(2147483647)
-  .safeParse(process.env.AMAZON_BROWSER_IDLE_TIMEOUT_MS ?? "300000");
-if (!browserIdleTimeoutSetting.success) {
-  throw new Error(
-    "AMAZON_BROWSER_IDLE_TIMEOUT_MS must be an integer between 0 and 2147483647 (0 disables idle closing)",
-  );
-}
-const browserIdleTimeoutMs = browserIdleTimeoutSetting.data;
-
-function clearBrowserIdleTimer(): void {
-  if (browserIdleTimer !== null) {
-    clearTimeout(browserIdleTimer);
-    browserIdleTimer = null;
-  }
-}
-
-function scheduleBrowserIdleClose(): void {
-  clearBrowserIdleTimer();
-  if (
-    browserIdleTimeoutMs === 0 || activeBrowserRequests > 0 ||
-    !browserContext || browserClosing
-  ) return;
-
-  const context = browserContext;
-  browserIdleTimer = setTimeout(() => {
-    browserIdleTimer = null;
-    if (activeBrowserRequests > 0 || browserContext !== context) return;
-    // Publish the closing promise before calling close, so new requests wait
-    // until Chromium releases the persistent profile before reopening it.
-    browserClosing = Promise.resolve()
-      .then(() => context.close())
-      .then(() => {
-        if (browserContext === context) {
-          browserContext = null;
-          page = null;
-        }
-        console.error("[browser] Closed Chromium after " + browserIdleTimeoutMs + " ms idle");
-      })
-      .catch((error) => {
-        console.error("[browser] Idle close failed:", error);
-      })
-      .finally(() => {
-        browserClosing = null;
-        // Retry later if closing failed and the context is still open.
-        scheduleBrowserIdleClose();
-      });
-  }, browserIdleTimeoutMs);
-  browserIdleTimer.unref();
-}
 
 // Browser data directory for session persistence.
 // Env var AMAZON_ORDERS_BROWSER_DATA_DIR overrides — required for multi-tenant
@@ -211,7 +157,7 @@ const tools: Tool[] = [
   {
     name: "get_amazon_orders",
     description:
-      "Fetch Amazon order history for a specified date range or year. Returns order summaries including: order ID, date, total amount, status, item count, item titles (product names shown on the order card), shipping address (7 lines), payment method, and Subscribe & Save frequency. Optionally includes detailed item data (ASIN, name, price, quantity, seller, condition) and shipment tracking. Use for browsing order history or building reports.",
+      "Fetch Amazon order history for a specified date range or year. Returns order summaries including: order ID, date, total amount, status, item count, item titles and quantities (product names and purchase quantities shown on the order card), shipping address (7 lines), payment method, and Subscribe & Save frequency. Optionally includes detailed item data (ASIN, name, price, quantity, seller, condition) and shipment tracking. Use for browsing order history or building reports.",
     inputSchema: {
       type: "object",
       properties: {
@@ -832,21 +778,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 // Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  activeBrowserRequests += 1;
-  clearBrowserIdleTimer();
-  try {
-    await browserClosing;
-    return await handleToolCall(request);
-  } finally {
-    activeBrowserRequests -= 1;
-    scheduleBrowserIdleClose();
-  }
-});
-
-async function handleToolCall(request: CallToolRequest): Promise<{
-  content: Array<{ type: string; text: string }>;
-  isError?: boolean;
-}> {
   const { name, arguments: args } = request.params;
 
   try {
@@ -905,6 +836,7 @@ async function handleToolCall(request: CallToolRequest): Promise<{
                     itemCount: o.itemCount ?? o.items?.length ?? 0,
                     // Item titles captured from the order list page (no invoice visit needed)
                     itemTitles: o.itemTitles,
+                    itemQuantities: o.itemQuantities,
                     // Shipment count from the list page; falls back to fetched shipments
                     shipmentCount: o.shipmentCount ?? o.shipments?.length ?? 0,
                     // Enhanced order header data from list page
@@ -1631,7 +1563,7 @@ async function handleToolCall(request: CallToolRequest): Promise<{
       isError: true,
     };
   }
-}
+});
 
 // Cleanup on exit
 process.on("SIGINT", async () => {

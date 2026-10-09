@@ -132,6 +132,8 @@ describe("order list extraction (integration)", () => {
       ]);
       // Item count is derived from the titles, not a separate heuristic
       expect(headers[0].itemCount).toBe(2);
+      // Quantities come from the product-image__qty badge (absent = 1)
+      expect(headers[0].itemQuantities).toEqual([2, 1]);
       // Shipment count is the number of delivery status boxes on the card
       expect(headers[0].shipmentCount).toBe(2);
     });
