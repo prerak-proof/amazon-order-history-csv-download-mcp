@@ -906,6 +906,8 @@ async function handleToolCall(request: CallToolRequest): Promise<{
                     // Item titles captured from the order list page (no invoice visit needed)
                     itemTitles: o.itemTitles,
                     itemQuantities: o.itemQuantities,
+                    // Subscribe & Save frequency captured from the order list page
+                    subscribeAndSave: o.subscribeAndSave,
                     // Shipment count from the list page; falls back to fetched shipments
                     shipmentCount: o.shipmentCount ?? o.shipments?.length ?? 0,
                     // Enhanced order header data from list page
