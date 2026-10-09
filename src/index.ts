@@ -7,7 +7,9 @@
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { createServer } from "node:http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   CallToolRequest,
@@ -19,6 +21,12 @@ import { chromium, BrowserContext, Page } from "playwright";
 import { z } from "zod";
 import { isAbsolute, join } from "path";
 import { homedir } from "os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  existsSync,
+  readFileSync,
+} from "node:fs";
 import packageMetadata from "../package.json";
 
 import { AmazonPlugin } from "./amazon/adapter";
@@ -37,6 +45,7 @@ import {
   isValidAmazonOrderId,
 } from "./tools";
 import { extractTransactionsFromPage } from "./amazon/extractors/transactions-page";
+import { extractOrderCardTexts } from "./amazon/extractors/order-list";
 import {
   extractGiftCardData,
   GiftCardData,
@@ -115,10 +124,11 @@ const BROWSER_DATA_DIR =
 async function getBrowserContext(): Promise<BrowserContext> {
   if (!browserContext) {
     const context = await chromium.launchPersistentContext(BROWSER_DATA_DIR, {
-      headless: false, // Need visible browser for login
+      channel: process.env.AMAZON_BROWSER_CHANNEL ?? "chromium",
+      headless:
+        (process.env.AMAZON_BROWSER_HEADLESS ?? "true").toLowerCase() ===
+        "true",
       viewport: { width: 1280, height: 800 },
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     });
     browserContext = context;
     // If the browser dies (crash, user closes the window, killed externally),
@@ -605,6 +615,42 @@ const tools: Tool[] = [
       required: ["region"],
     },
   },
+  {
+    name: "refresh_code",
+    description:
+      "Pull the latest MCP code from the configured repo/ref (AMAZON_MCP_REPO and AMAZON_MCP_REF, same as the container entrypoint uses) by running the entrypoint's own build step, then restart onto the new build. Only the configured repo/ref are ever fetched. Returns updated/already_current/error. Use after pushing new commits instead of asking for a container restart. The fetch plus TypeScript build can take a few minutes.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "debug_order_cards",
+    description:
+      "Return the raw text of order cards on the order history page for debugging extraction against live layouts (e.g. finding Subscribe & Save markers). Returns each card's order ID when identifiable plus its full card text, truncated per card. Read-only: loads the order history page but changes nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        region: {
+          type: "string",
+          description: "Amazon region code",
+          enum: getRegionCodes(),
+        },
+        year: {
+          type: "number",
+          description:
+            "Order history year to inspect (e.g., 2026). Defaults to the current year.",
+        },
+        max_cards: {
+          type: "number",
+          description:
+            "Maximum number of cards to return (1-50). Defaults to 10.",
+          default: 10,
+        },
+      },
+      required: ["region"],
+    },
+  },
 ];
 
 // Create server instance
@@ -822,6 +868,78 @@ async function handleInvoiceDownload(
   return {
     content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
     ...(result.success ? {} : { isError: true }),
+  };
+}
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Pull the latest MCP code and rebuild by delegating to the container
+ * entrypoint's --build flow (the same build start.sh runs on every
+ * container start), so the build logic lives in exactly one place. Only the
+ * repo/ref configured via AMAZON_MCP_REPO and AMAZON_MCP_REF are ever
+ * fetched — the tool takes no repository arguments. On success the new build
+ * is installed into /app and the process exits so the container restarts
+ * onto the new code.
+ */
+async function refreshCode(): Promise<{
+  status: "updated" | "already_current" | "error";
+  old_commit?: string | null;
+  new_commit?: string;
+  detail: string;
+}> {
+  const startScript = "/opt/amazon-start.sh";
+  if (!existsSync(startScript)) {
+    return {
+      status: "error",
+      detail:
+        "refresh_code requires the Synology container layout (/opt/amazon-start.sh not found)",
+    };
+  }
+
+  let currentCommit = "";
+  try {
+    currentCommit = readFileSync("/app/UPSTREAM_COMMIT", "utf8").trim();
+  } catch {
+    // No record of the running commit; treat as needing update.
+  }
+
+  try {
+    await execFileAsync("bash", [startScript, "--build"], {
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      timeout: 600000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  } catch (error) {
+    return {
+      status: "error",
+      detail: `build failed: ${String(error).slice(0, 500)}`,
+    };
+  }
+
+  let newCommit = "";
+  try {
+    newCommit = readFileSync("/app/UPSTREAM_COMMIT", "utf8").trim();
+  } catch {
+    return { status: "error", detail: "build succeeded but UPSTREAM_COMMIT is missing" };
+  }
+  if (currentCommit && newCommit === currentCommit) {
+    return {
+      status: "already_current",
+      new_commit: currentCommit,
+      detail: "Already running the latest commit",
+    };
+  }
+
+  // Let the response flush, then exit so the container restarts onto the
+  // new build (start.sh re-fetches, which is a no-op, and launches it).
+  setTimeout(() => process.exit(0), 2000).unref();
+
+  return {
+    status: "updated",
+    old_commit: currentCommit || null,
+    new_commit: newCommit,
+    detail: "New code installed; server is restarting to pick it up",
   };
 }
 
@@ -1608,6 +1726,97 @@ async function handleToolCall(request: CallToolRequest): Promise<{
         };
       }
 
+      case "refresh_code": {
+        const result = await refreshCode();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+          ...(result.status === "error" ? { isError: true } : {}),
+        };
+      }
+
+      case "debug_order_cards": {
+        const regionParam = args?.region as string | undefined;
+        const regionError = validateRegion(regionParam, args);
+        if (regionError) return regionError;
+        const region = regionParam!;
+        const requestedYear =
+          (args?.year as number | undefined) ?? new Date().getFullYear();
+        const maxCards = Math.min(
+          Math.max((args?.max_cards as number | undefined) ?? 10, 1),
+          50,
+        );
+
+        const currentPage = await getPage();
+        const authStatus = await amazonPlugin.checkAuthStatus(
+          currentPage,
+          region,
+        );
+        if (!authStatus.authenticated) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "error",
+                    params: { region },
+                    error: `Not authenticated: ${authStatus.message}`,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const listUrl = amazonPlugin.getOrderListUrl(region, {
+          year: requestedYear,
+        });
+        await currentPage.goto(listUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 60000,
+        });
+        await currentPage
+          .waitForSelector('.order-card, [class*="order-card"], .a-box-group', {
+            timeout: 3000,
+          })
+          .catch(() => {});
+
+        const cards = await extractOrderCardTexts(currentPage);
+        const maxChars = 4000;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "success",
+                  params: {
+                    region,
+                    year: requestedYear,
+                    max_cards: maxCards,
+                  },
+                  cards: cards.slice(0, maxCards).map((c) => ({
+                    orderId: c.orderId,
+                    text: c.text.slice(0, maxChars),
+                    truncated: c.text.length > maxChars,
+                  })),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
       default:
         return {
           content: [
@@ -1653,9 +1862,89 @@ process.on("SIGTERM", async () => {
 
 // Main entry point
 async function main(): Promise<void> {
-  const transport = new StdioServerTransport();
+  const transportMode = (
+    process.env.MCP_TRANSPORT ?? "streamable-http"
+  ).toLowerCase();
+
+  if (transportMode === "stdio") {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error(
+      "Amazon Order History CSV Download MCP server running over stdio",
+    );
+    return;
+  }
+
+  if (transportMode !== "streamable-http" && transportMode !== "http") {
+    throw new Error(
+      `Unsupported MCP_TRANSPORT="${transportMode}". Use streamable-http or stdio.`,
+    );
+  }
+
+  const host = process.env.MCP_HOST ?? "0.0.0.0";
+  const port = Number.parseInt(process.env.MCP_PORT ?? "8000", 10);
+  const mcpPathRaw = process.env.MCP_PATH ?? "/mcp";
+  const mcpPath = mcpPathRaw.startsWith("/") ? mcpPathRaw : `/${mcpPathRaw}`;
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid MCP_PORT: ${process.env.MCP_PORT}`);
+  }
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: false,
+  });
   await server.connect(transport);
-  console.error("Amazon Order History CSV Download MCP server running");
+
+  const httpServer = createServer(async (req, res) => {
+    const requestUrl = new URL(
+      req.url ?? "/",
+      `http://${req.headers.host ?? "localhost"}`,
+    );
+
+    if (requestUrl.pathname === "/healthz") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+
+    if (requestUrl.pathname !== mcpPath) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "not_found",
+          mcp_endpoint: mcpPath,
+        }),
+      );
+      return;
+    }
+
+    try {
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("[mcp-http] request failed:", error);
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+      }
+      if (!res.writableEnded) {
+        res.end(
+          JSON.stringify({
+            error: "mcp_transport_error",
+            message: String(error),
+          }),
+        );
+      }
+    }
+  });
+
+  httpServer.listen(port, host, () => {
+    console.error(
+      `Amazon Order History MCP listening at http://${host}:${port}${mcpPath}`,
+    );
+  });
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

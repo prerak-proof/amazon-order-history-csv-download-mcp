@@ -114,6 +114,9 @@ async function harness(timeout) {
   const h = await harness();
   await h.call();
   assert.equal(h.launches[0].profile, "/test/profile");
+  assert.equal(h.launches[0].options.channel, "chromium");
+  assert.equal(h.launches[0].options.headless, true);
+  assert.equal(Object.hasOwn(h.launches[0].options, "userAgent"), false);
   await h.advance(299999);
   assert.equal(h.contexts[0].closed, false);
   await h.health();
