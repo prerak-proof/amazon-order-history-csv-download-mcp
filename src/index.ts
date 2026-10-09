@@ -21,6 +21,18 @@ import { chromium, BrowserContext, Page } from "playwright";
 import { z } from "zod";
 import { isAbsolute, join } from "path";
 import { homedir } from "os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import packageMetadata from "../package.json";
 
 import { AmazonPlugin } from "./amazon/adapter";
@@ -39,6 +51,7 @@ import {
   isValidAmazonOrderId,
 } from "./tools";
 import { extractTransactionsFromPage } from "./amazon/extractors/transactions-page";
+import { extractOrderCardTexts } from "./amazon/extractors/order-list";
 import {
   extractGiftCardData,
   GiftCardData,
@@ -608,6 +621,42 @@ const tools: Tool[] = [
       required: ["region"],
     },
   },
+  {
+    name: "refresh_code",
+    description:
+      "Pull the latest MCP code from the configured repo/ref (AMAZON_MCP_REPO and AMAZON_MCP_REF, same as the container entrypoint uses) and rebuild. Only the configured repo/ref are ever fetched. Returns updated/already_current/error; on updated the new build is installed and the server restarts itself onto it. Use after pushing new commits instead of asking for a container restart. The fetch plus TypeScript build can take a couple of minutes.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "debug_order_cards",
+    description:
+      "Return the raw text of order cards on the order history page for debugging extraction against live layouts (e.g. finding Subscribe & Save markers). Returns each card's order ID when identifiable plus its full card text, truncated per card. Read-only: loads the order history page but changes nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        region: {
+          type: "string",
+          description: "Amazon region code",
+          enum: getRegionCodes(),
+        },
+        year: {
+          type: "number",
+          description:
+            "Order history year to inspect (e.g., 2026). Defaults to the current year.",
+        },
+        max_cards: {
+          type: "number",
+          description:
+            "Maximum number of cards to return (1-50). Defaults to 10.",
+          default: 10,
+        },
+      },
+      required: ["region"],
+    },
+  },
 ];
 
 // Create server instance
@@ -826,6 +875,127 @@ async function handleInvoiceDownload(
     content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
     ...(result.success ? {} : { isError: true }),
   };
+}
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Pull the latest MCP code and rebuild, mirroring the container start.sh
+ * --build flow. Only the repo/ref configured via AMAZON_MCP_REPO and
+ * AMAZON_MCP_REF are ever fetched — the tool takes no repository arguments.
+ * On success the new build is installed into /app and the process exits so
+ * the container restarts onto the new code.
+ */
+async function refreshCode(): Promise<{
+  status: "updated" | "already_current" | "error";
+  old_commit?: string | null;
+  new_commit?: string;
+  detail: string;
+}> {
+  const repo = process.env.AMAZON_MCP_REPO;
+  const ref = process.env.AMAZON_MCP_REF;
+  if (!repo || !ref) {
+    return {
+      status: "error",
+      detail:
+        "AMAZON_MCP_REPO and AMAZON_MCP_REF must be set in the container environment",
+    };
+  }
+
+  const buildDir = "/app/.refresh-build";
+  const run = (cmd: string, args: string[], cwd?: string) =>
+    execFileAsync(cmd, args, {
+      cwd,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      timeout: 300000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+
+  try {
+    rmSync(buildDir, { recursive: true, force: true });
+    mkdirSync(buildDir, { recursive: true });
+
+    await run("git", ["init", "-q", buildDir]);
+    await run("git", [
+      "-C",
+      buildDir,
+      "fetch",
+      "--quiet",
+      "--depth=1",
+      "--",
+      repo,
+      ref,
+    ]);
+    await run("git", [
+      "-C",
+      buildDir,
+      "checkout",
+      "--quiet",
+      "--detach",
+      "FETCH_HEAD",
+    ]);
+    const newCommit = (
+      await run("git", ["-C", buildDir, "rev-parse", "HEAD"])
+    ).stdout.trim();
+
+    let currentCommit = "";
+    try {
+      currentCommit = readFileSync("/app/UPSTREAM_COMMIT", "utf8").trim();
+    } catch {
+      // No record of the running commit; treat as needing update.
+    }
+    if (currentCommit && newCommit === currentCommit) {
+      return {
+        status: "already_current",
+        new_commit: currentCommit,
+        detail: "Already running the latest commit",
+      };
+    }
+
+    // Same guard as start.sh: dependencies are baked into the image, so a
+    // manifest change means the image must be rebuilt, not hot-swapped.
+    for (const manifest of ["package.json", "package-lock.json"]) {
+      const fresh = readFileSync(join(buildDir, manifest));
+      const installed = readFileSync(join("/app", manifest));
+      if (!fresh.equals(installed)) {
+        return {
+          status: "error",
+          detail:
+            `${manifest} differs from the installed image. ` +
+            `Rebuild the image with UPSTREAM_REF=${newCommit}, then recreate the containers.`,
+        };
+      }
+    }
+
+    rmSync(join(buildDir, "node_modules"), { force: true });
+    symlinkSync("/app/node_modules", join(buildDir, "node_modules"));
+    await run("npm", ["run", "build"], buildDir);
+    const distIndex = join(buildDir, "dist", "index.js");
+    if (!existsSync(distIndex) || statSync(distIndex).size === 0) {
+      throw new Error("build did not produce dist/index.js");
+    }
+
+    rmSync("/app/dist", { recursive: true, force: true });
+    rmSync("/app/src", { recursive: true, force: true });
+    renameSync(join(buildDir, "dist"), "/app/dist");
+    renameSync(join(buildDir, "src"), "/app/src");
+    writeFileSync("/app/UPSTREAM_COMMIT", `${newCommit}\n`);
+
+    // Let the response flush, then exit so the container restarts onto the
+    // new build (start.sh re-fetches, which is a no-op, and launches it).
+    setTimeout(() => process.exit(0), 2000).unref();
+
+    return {
+      status: "updated",
+      old_commit: currentCommit || null,
+      new_commit: newCommit,
+      detail: "New code installed; server is restarting to pick it up",
+    };
+  } catch (error) {
+    return { status: "error", detail: String(error).slice(0, 500) };
+  } finally {
+    rmSync(buildDir, { recursive: true, force: true });
+  }
 }
 
 // Handle list tools request
@@ -1602,6 +1772,97 @@ async function handleToolCall(request: CallToolRequest): Promise<{
                   loginUrl: authStatus.authenticated
                     ? undefined
                     : amazonPlugin.getLoginUrl(region),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      case "refresh_code": {
+        const result = await refreshCode();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+          ...(result.status === "error" ? { isError: true } : {}),
+        };
+      }
+
+      case "debug_order_cards": {
+        const regionParam = args?.region as string | undefined;
+        const regionError = validateRegion(regionParam, args);
+        if (regionError) return regionError;
+        const region = regionParam!;
+        const requestedYear =
+          (args?.year as number | undefined) ?? new Date().getFullYear();
+        const maxCards = Math.min(
+          Math.max((args?.max_cards as number | undefined) ?? 10, 1),
+          50,
+        );
+
+        const currentPage = await getPage();
+        const authStatus = await amazonPlugin.checkAuthStatus(
+          currentPage,
+          region,
+        );
+        if (!authStatus.authenticated) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "error",
+                    params: { region },
+                    error: `Not authenticated: ${authStatus.message}`,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const listUrl = amazonPlugin.getOrderListUrl(region, {
+          year: requestedYear,
+        });
+        await currentPage.goto(listUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 60000,
+        });
+        await currentPage
+          .waitForSelector('.order-card, [class*="order-card"], .a-box-group', {
+            timeout: 3000,
+          })
+          .catch(() => {});
+
+        const cards = await extractOrderCardTexts(currentPage);
+        const maxChars = 4000;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "success",
+                  params: {
+                    region,
+                    year: requestedYear,
+                    max_cards: maxCards,
+                  },
+                  cards: cards.slice(0, maxCards).map((c) => ({
+                    orderId: c.orderId,
+                    text: c.text.slice(0, maxChars),
+                    truncated: c.text.length > maxChars,
+                  })),
                 },
                 null,
                 2,
