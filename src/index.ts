@@ -7,7 +7,9 @@
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { createServer } from "node:http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   CallToolRequest,
@@ -115,10 +117,11 @@ const BROWSER_DATA_DIR =
 async function getBrowserContext(): Promise<BrowserContext> {
   if (!browserContext) {
     const context = await chromium.launchPersistentContext(BROWSER_DATA_DIR, {
-      headless: false, // Need visible browser for login
+      channel: process.env.AMAZON_BROWSER_CHANNEL ?? "chromium",
+      headless:
+        (process.env.AMAZON_BROWSER_HEADLESS ?? "true").toLowerCase() ===
+        "true",
       viewport: { width: 1280, height: 800 },
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     });
     browserContext = context;
     // If the browser dies (crash, user closes the window, killed externally),
@@ -1653,9 +1656,89 @@ process.on("SIGTERM", async () => {
 
 // Main entry point
 async function main(): Promise<void> {
-  const transport = new StdioServerTransport();
+  const transportMode = (
+    process.env.MCP_TRANSPORT ?? "streamable-http"
+  ).toLowerCase();
+
+  if (transportMode === "stdio") {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error(
+      "Amazon Order History CSV Download MCP server running over stdio",
+    );
+    return;
+  }
+
+  if (transportMode !== "streamable-http" && transportMode !== "http") {
+    throw new Error(
+      `Unsupported MCP_TRANSPORT="${transportMode}". Use streamable-http or stdio.`,
+    );
+  }
+
+  const host = process.env.MCP_HOST ?? "0.0.0.0";
+  const port = Number.parseInt(process.env.MCP_PORT ?? "8000", 10);
+  const mcpPathRaw = process.env.MCP_PATH ?? "/mcp";
+  const mcpPath = mcpPathRaw.startsWith("/") ? mcpPathRaw : `/${mcpPathRaw}`;
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid MCP_PORT: ${process.env.MCP_PORT}`);
+  }
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: false,
+  });
   await server.connect(transport);
-  console.error("Amazon Order History CSV Download MCP server running");
+
+  const httpServer = createServer(async (req, res) => {
+    const requestUrl = new URL(
+      req.url ?? "/",
+      `http://${req.headers.host ?? "localhost"}`,
+    );
+
+    if (requestUrl.pathname === "/healthz") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+
+    if (requestUrl.pathname !== mcpPath) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "not_found",
+          mcp_endpoint: mcpPath,
+        }),
+      );
+      return;
+    }
+
+    try {
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("[mcp-http] request failed:", error);
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+      }
+      if (!res.writableEnded) {
+        res.end(
+          JSON.stringify({
+            error: "mcp_transport_error",
+            message: String(error),
+          }),
+        );
+      }
+    }
+  });
+
+  httpServer.listen(port, host, () => {
+    console.error(
+      `Amazon Order History MCP listening at http://${host}:${port}${mcpPath}`,
+    );
+  });
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
