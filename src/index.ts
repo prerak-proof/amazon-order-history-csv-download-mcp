@@ -25,13 +25,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   existsSync,
-  mkdirSync,
   readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-  symlinkSync,
-  writeFileSync,
 } from "node:fs";
 import packageMetadata from "../package.json";
 
@@ -624,7 +618,7 @@ const tools: Tool[] = [
   {
     name: "refresh_code",
     description:
-      "Pull the latest MCP code from the configured repo/ref (AMAZON_MCP_REPO and AMAZON_MCP_REF, same as the container entrypoint uses) and rebuild. Only the configured repo/ref are ever fetched. Returns updated/already_current/error; on updated the new build is installed and the server restarts itself onto it. Use after pushing new commits instead of asking for a container restart. The fetch plus TypeScript build can take a couple of minutes.",
+      "Pull the latest MCP code from the configured repo/ref (AMAZON_MCP_REPO and AMAZON_MCP_REF, same as the container entrypoint uses) by running the entrypoint's own build step, then restart onto the new build. Only the configured repo/ref are ever fetched. Returns updated/already_current/error. Use after pushing new commits instead of asking for a container restart. The fetch plus TypeScript build can take a few minutes.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -880,11 +874,13 @@ async function handleInvoiceDownload(
 const execFileAsync = promisify(execFile);
 
 /**
- * Pull the latest MCP code and rebuild, mirroring the container start.sh
- * --build flow. Only the repo/ref configured via AMAZON_MCP_REPO and
- * AMAZON_MCP_REF are ever fetched — the tool takes no repository arguments.
- * On success the new build is installed into /app and the process exits so
- * the container restarts onto the new code.
+ * Pull the latest MCP code and rebuild by delegating to the container
+ * entrypoint's --build flow (the same build start.sh runs on every
+ * container start), so the build logic lives in exactly one place. Only the
+ * repo/ref configured via AMAZON_MCP_REPO and AMAZON_MCP_REF are ever
+ * fetched — the tool takes no repository arguments. On success the new build
+ * is installed into /app and the process exits so the container restarts
+ * onto the new code.
  */
 async function refreshCode(): Promise<{
   status: "updated" | "already_current" | "error";
@@ -892,110 +888,59 @@ async function refreshCode(): Promise<{
   new_commit?: string;
   detail: string;
 }> {
-  const repo = process.env.AMAZON_MCP_REPO;
-  const ref = process.env.AMAZON_MCP_REF;
-  if (!repo || !ref) {
+  const startScript = "/opt/amazon-start.sh";
+  if (!existsSync(startScript)) {
     return {
       status: "error",
       detail:
-        "AMAZON_MCP_REPO and AMAZON_MCP_REF must be set in the container environment",
+        "refresh_code requires the Synology container layout (/opt/amazon-start.sh not found)",
     };
   }
 
-  const buildDir = "/app/.refresh-build";
-  const run = (cmd: string, args: string[], cwd?: string) =>
-    execFileAsync(cmd, args, {
-      cwd,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-      timeout: 300000,
-      maxBuffer: 10 * 1024 * 1024,
-    });
+  let currentCommit = "";
+  try {
+    currentCommit = readFileSync("/app/UPSTREAM_COMMIT", "utf8").trim();
+  } catch {
+    // No record of the running commit; treat as needing update.
+  }
 
   try {
-    rmSync(buildDir, { recursive: true, force: true });
-    mkdirSync(buildDir, { recursive: true });
-
-    await run("git", ["init", "-q", buildDir]);
-    await run("git", [
-      "-C",
-      buildDir,
-      "fetch",
-      "--quiet",
-      "--depth=1",
-      "--",
-      repo,
-      ref,
-    ]);
-    await run("git", [
-      "-C",
-      buildDir,
-      "checkout",
-      "--quiet",
-      "--detach",
-      "FETCH_HEAD",
-    ]);
-    const newCommit = (
-      await run("git", ["-C", buildDir, "rev-parse", "HEAD"])
-    ).stdout.trim();
-
-    let currentCommit = "";
-    try {
-      currentCommit = readFileSync("/app/UPSTREAM_COMMIT", "utf8").trim();
-    } catch {
-      // No record of the running commit; treat as needing update.
-    }
-    if (currentCommit && newCommit === currentCommit) {
-      return {
-        status: "already_current",
-        new_commit: currentCommit,
-        detail: "Already running the latest commit",
-      };
-    }
-
-    // Same guard as start.sh: dependencies are baked into the image, so a
-    // manifest change means the image must be rebuilt, not hot-swapped.
-    for (const manifest of ["package.json", "package-lock.json"]) {
-      const fresh = readFileSync(join(buildDir, manifest));
-      const installed = readFileSync(join("/app", manifest));
-      if (!fresh.equals(installed)) {
-        return {
-          status: "error",
-          detail:
-            `${manifest} differs from the installed image. ` +
-            `Rebuild the image with UPSTREAM_REF=${newCommit}, then recreate the containers.`,
-        };
-      }
-    }
-
-    rmSync(join(buildDir, "node_modules"), { force: true });
-    symlinkSync("/app/node_modules", join(buildDir, "node_modules"));
-    await run("npm", ["run", "build"], buildDir);
-    const distIndex = join(buildDir, "dist", "index.js");
-    if (!existsSync(distIndex) || statSync(distIndex).size === 0) {
-      throw new Error("build did not produce dist/index.js");
-    }
-
-    rmSync("/app/dist", { recursive: true, force: true });
-    rmSync("/app/src", { recursive: true, force: true });
-    renameSync(join(buildDir, "dist"), "/app/dist");
-    renameSync(join(buildDir, "src"), "/app/src");
-    writeFileSync("/app/UPSTREAM_COMMIT", `${newCommit}\n`);
-
-    // Let the response flush, then exit so the container restarts onto the
-    // new build (start.sh re-fetches, which is a no-op, and launches it).
-    setTimeout(() => process.exit(0), 2000).unref();
-
-    return {
-      status: "updated",
-      old_commit: currentCommit || null,
-      new_commit: newCommit,
-      detail: "New code installed; server is restarting to pick it up",
-    };
+    await execFileAsync("bash", [startScript, "--build"], {
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      timeout: 600000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
   } catch (error) {
-    return { status: "error", detail: String(error).slice(0, 500) };
-  } finally {
-    rmSync(buildDir, { recursive: true, force: true });
+    return {
+      status: "error",
+      detail: `build failed: ${String(error).slice(0, 500)}`,
+    };
   }
+
+  let newCommit = "";
+  try {
+    newCommit = readFileSync("/app/UPSTREAM_COMMIT", "utf8").trim();
+  } catch {
+    return { status: "error", detail: "build succeeded but UPSTREAM_COMMIT is missing" };
+  }
+  if (currentCommit && newCommit === currentCommit) {
+    return {
+      status: "already_current",
+      new_commit: currentCommit,
+      detail: "Already running the latest commit",
+    };
+  }
+
+  // Let the response flush, then exit so the container restarts onto the
+  // new build (start.sh re-fetches, which is a no-op, and launches it).
+  setTimeout(() => process.exit(0), 2000).unref();
+
+  return {
+    status: "updated",
+    old_commit: currentCommit || null,
+    new_commit: newCommit,
+    detail: "New code installed; server is restarting to pick it up",
+  };
 }
 
 // Handle list tools request
