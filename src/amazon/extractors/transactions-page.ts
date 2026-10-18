@@ -983,24 +983,32 @@ async function goToNextPage(page: Page): Promise<NextPageResult> {
 
   // "Load more" button variant (seen on some accounts instead of the
   // ppw Next input): clicking it appends the next chunk of transactions.
+  // Chunk loads on this variant are slow (a live walk averaged ~14s per
+  // page), and repeated clicking/scrolling appears to restart the load —
+  // so: bring the button into view, click ONCE, then poll undisturbed
+  // for up to 30s before trying again.
   const loadMore = page
     .locator('button, [role="button"], a')
     .filter({ hasText: /^\s*load more\s*$/i });
   const loadMoreCount = await loadMore.count().catch(() => 0);
   if (loadMoreCount > 0) {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 2; attempt++) {
       const before = await readPageSignature(page).catch(
         () => null as PageSignature | null,
       );
       await loadMore
         .first()
-        .click({ timeout: 3000, noWaitAfter: true })
+        .scrollIntoViewIfNeeded({ timeout: 5000 })
+        .catch(() => {});
+      await loadMore
+        .first()
+        .click({ timeout: 5000, noWaitAfter: true })
         .catch(() => {});
 
-      const deadline = Date.now() + APX_PAGE_TRANSITION_TIMEOUT_MS;
+      const deadline = Date.now() + 30000;
       let grew = false;
       while (Date.now() < deadline) {
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(500);
         const after = await readPageSignature(page).catch(
           () => null as PageSignature | null,
         );
