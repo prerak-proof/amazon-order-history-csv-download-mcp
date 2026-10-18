@@ -767,6 +767,12 @@ export interface ExtractShipmentsOptions {
    * invoice or detail page, and re-extracting them doubles the work).
    */
   items?: Item[];
+  /**
+   * Optional out-param: filled with the duration (ms) of each shipment
+   * strategy attempted, keyed by strategy name. Strategies after the
+   * first successful one do not run and get no entry.
+   */
+  strategyTimings?: Record<string, number>;
 }
 
 /**
@@ -780,16 +786,37 @@ export async function extractShipments(
   const { fetchTrackingNumbers = false } = options;
 
   // Use caller-provided items when available; extract only as a fallback.
-  const items = options.items ?? (await extractItems(page, header));
+  let items = options.items;
+  if (!items) {
+    const tItems = Date.now();
+    items = await extractItems(page, header);
+    const ms = Date.now() - tItems;
+    if (options.strategyTimings) options.strategyTimings.itemsMs = ms;
+    console.error(`[shipments][timing] itemsExtraction: ${ms}ms`);
+  }
 
-  // Try each extraction strategy (AZAD order: A, B, then fallbacks)
+  // Try each extraction strategy (AZAD order: A, B, then fallbacks),
+  // timing each attempt so slow stages are visible in the server log.
+  const timed = async (
+    name: string,
+    fn: () => Promise<Shipment[] | null>,
+  ): Promise<Shipment[] | null> => {
+    const start = Date.now();
+    try {
+      return await fn();
+    } finally {
+      const ms = Date.now() - start;
+      if (options.strategyTimings) options.strategyTimings[name] = ms;
+      console.error(`[shipments][timing] ${name}: ${ms}ms`);
+    }
+  };
   const shipments = await firstMatchingStrategy<Shipment[]>(
     [
-      () => extractShipmentsStrategyA(page, header, items), // AZAD's a-box.shipment
-      () => extractShipmentsStrategyB(page, header, items), // AZAD's data-component 2024+
-      () => extractShipmentsStrategy2(page, header, items), // Delivery status sections
-      () => extractShipmentsStrategy1(page, header, items), // Tracking sections
-      () => extractShipmentsStrategy3(page, header, items), // Fallback single shipment
+      () => timed("strategyA", () => extractShipmentsStrategyA(page, header, items)), // AZAD's a-box.shipment
+      () => timed("strategyB", () => extractShipmentsStrategyB(page, header, items)), // AZAD's data-component 2024+
+      () => timed("strategy2", () => extractShipmentsStrategy2(page, header, items)), // Delivery status sections
+      () => timed("strategy1", () => extractShipmentsStrategy1(page, header, items)), // Tracking sections
+      () => timed("strategy3", () => extractShipmentsStrategy3(page, header, items)), // Fallback single shipment
     ],
     [],
   );

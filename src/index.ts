@@ -1041,6 +1041,7 @@ async function handleToolCall(request: CallToolRequest): Promise<{
                     cardInfo: t.cardInfo,
                   })),
                   errors: result.errors,
+                  timings: result.timings ?? null,
                 },
                 null,
                 2,

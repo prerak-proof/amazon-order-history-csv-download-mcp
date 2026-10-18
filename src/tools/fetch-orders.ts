@@ -106,6 +106,8 @@ export interface FetchOrdersResult {
   transactions: Transaction[];
   totalFound: number;
   errors: string[];
+  /** Stage timings in ms (single-order fetches only). */
+  timings?: Record<string, number>;
 }
 
 interface ParsedDateBound {
@@ -256,6 +258,9 @@ export async function fetchOrders(
       );
       onProgress?.(`Fetching order ${orderId}...`, 0, 1);
 
+      const t0 = Date.now();
+      const timings: Record<string, number> = {};
+
       // Create header for this order
       const header: OrderHeader = {
         id: orderId,
@@ -269,7 +274,9 @@ export async function fetchOrders(
 
       const enrichedOrder: EnrichedOrder = { ...header };
 
+      const tInvoice = Date.now();
       const invoiceData = await extractFromInvoice(page, header);
+      timings.invoiceMs = Date.now() - tInvoice;
 
       // Check for error banners (e.g., "We're unable to load your order details")
       const errorBanner = await page
@@ -367,6 +374,7 @@ export async function fetchOrders(
       }
 
       // If no items found from invoice, try the detail page
+      const tDetailItems = Date.now();
       if (result.items.length === 0 && result.errors.length === 0) {
         console.error(
           `[fetch-orders] No items from invoice, trying detail page extraction`,
@@ -417,9 +425,12 @@ export async function fetchOrders(
         }
       }
 
+      timings.detailItemsMs = Date.now() - tDetailItems;
+
       // Get shipments from detail page if requested
       if (includeShipments) {
         console.error(`[fetch-orders] Fetching shipments from detail page`);
+        const tShipNav = Date.now();
         // Only navigate if not already there
         if (!page.url().includes("order-details")) {
           await page.goto(header.detailUrl, {
@@ -432,25 +443,46 @@ export async function fetchOrders(
             })
             .catch(() => {});
         }
+        timings.shipmentsNavMs = Date.now() - tShipNav;
 
+        const tShip = Date.now();
+        const shipStrategyTimings: Record<string, number> = {};
         const shipments = await plugin
-          .extractShipments(page, header, fetchTrackingNumbers, result.items)
+          .extractShipments(
+            page,
+            header,
+            fetchTrackingNumbers,
+            result.items,
+            shipStrategyTimings,
+          )
           .catch(() => []);
         enrichedOrder.shipments = shipments;
         result.shipments = shipments;
+        timings.shipmentsMs = Date.now() - tShip;
+        for (const [k, v] of Object.entries(shipStrategyTimings)) {
+          timings[`ship_${k}`] = v;
+        }
         console.error(`[fetch-orders] Found ${shipments.length} shipments`);
       }
 
       // Get transactions if requested
       if (includeTransactions) {
+        const tTxn = Date.now();
         const transactions = await plugin
           .extractTransactions(page, header)
           .catch(() => []);
         result.transactions = transactions;
+        timings.transactionsMs = Date.now() - tTxn;
         console.error(
           `[fetch-orders] Found ${transactions.length} transactions`,
         );
       }
+
+      timings.totalMs = Date.now() - t0;
+      result.timings = timings;
+      console.error(
+        `[fetch-orders][timing] ${orderId}: ${JSON.stringify(timings)}`,
+      );
 
       result.orders = [enrichedOrder];
       result.totalFound = 1;
