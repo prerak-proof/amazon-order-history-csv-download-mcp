@@ -981,6 +981,41 @@ async function goToNextPage(page: Page): Promise<NextPageResult> {
     return { advanced: false, reason: "click_no_transition" };
   }
 
+  // "Load more" button variant (seen on some accounts instead of the
+  // ppw Next input): clicking it appends the next chunk of transactions.
+  const loadMore = page
+    .locator('button, [role="button"], a')
+    .filter({ hasText: /^\s*load more\s*$/i });
+  const loadMoreCount = await loadMore.count().catch(() => 0);
+  if (loadMoreCount > 0) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = await readPageSignature(page).catch(
+        () => null as PageSignature | null,
+      );
+      await loadMore
+        .first()
+        .click({ timeout: 3000, noWaitAfter: true })
+        .catch(() => {});
+
+      const deadline = Date.now() + APX_PAGE_TRANSITION_TIMEOUT_MS;
+      let grew = false;
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(300);
+        const after = await readPageSignature(page).catch(
+          () => null as PageSignature | null,
+        );
+        if (signatureChanged(before, after)) {
+          grew = true;
+          break;
+        }
+      }
+      if (grew) {
+        return { advanced: true, reason: "load_more" };
+      }
+    }
+    return { advanced: false, reason: "load_more_no_transition" };
+  }
+
   // Legacy infinite-scroll layout: scroll to load more, then WAIT for
   // the list to actually grow. (This branch previously returned success
   // unconditionally after a 500ms pause, so walks on scroll-variant
