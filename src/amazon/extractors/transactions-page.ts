@@ -226,6 +226,34 @@ export async function extractTransactionsFromPage(
     const pageNewest = Math.max(
       ...pageTransactions.map((t) => t.date.getTime()),
     );
+
+    // Seek fallback: the header-based range read can miss on some page
+    // variants; if the extracted page still lies entirely NEWER than
+    // the requested window, treat it as a seek page (do not merge, do
+    // not feed the stable counter) and keep moving.
+    if (endDate && pageOldest > endDate.getTime()) {
+      if (diag) {
+        diag.seekPagesSkipped++;
+        diag.trace.push({
+          page: pageCount + 1,
+          phase: "seek",
+          newest: isoDay(pageNewest),
+          oldest: isoDay(pageOldest),
+          rows: pageTransactions.length,
+        });
+        if (!diag.newestDate) diag.newestDate = isoDay(pageNewest);
+        diag.deepestDate = isoDay(pageOldest);
+      }
+      const advSeek = await goToNextPage(page);
+      if (!advSeek.advanced) {
+        stopReason = "no_next_page";
+        stopDetail = `seek phase (extracted): ${advSeek.reason}`;
+        break;
+      }
+      pageCount++;
+      continue;
+    }
+
     if (diag) {
       diag.pagesVisited++;
       diag.trace.push({
@@ -811,28 +839,52 @@ function parseTransactionText(
 
 interface PageSignature {
   dateText: string;
+  lastDateText: string;
   firstRow: string;
+  lastRow: string;
   rowCount: number;
 }
 
 /**
  * Cheap page fingerprint used to detect a completed page transition:
- * the first date header plus the first transaction row's text.
+ * the first and last date headers plus the first and last transaction
+ * rows. Both ends matter: on the button-paginated variant a turn
+ * replaces the whole list (first row changes), while on the
+ * accumulating scroll variant the newest rows stay pinned and only
+ * the tail grows (row count and last row change).
  */
 async function readPageSignature(page: Page): Promise<PageSignature> {
   return page.evaluate((selector: string) => {
     const browserWindow = globalThis as unknown as BrowserWindow;
-    const dateEl = browserWindow.document.querySelectorAll(
+    const dateEls = browserWindow.document.querySelectorAll(
       ".apx-transaction-date-container",
-    )[0];
+    );
     const rows = browserWindow.document.querySelectorAll(selector);
     const first = rows[0];
+    const last = rows[rows.length - 1];
     return {
-      dateText: dateEl?.textContent?.trim() || "",
+      dateText: dateEls[0]?.textContent?.trim() || "",
+      lastDateText: dateEls[dateEls.length - 1]?.textContent?.trim() || "",
       firstRow: first?.textContent?.trim() || "",
+      lastRow: last?.textContent?.trim() || "",
       rowCount: rows.length,
     };
   }, APX_TRANSACTION_SELECTOR);
+}
+
+function signatureChanged(
+  before: PageSignature | null,
+  after: PageSignature | null,
+): boolean {
+  if (!after || after.rowCount === 0) return false;
+  if (!before) return true;
+  return (
+    after.rowCount !== before.rowCount ||
+    after.dateText !== before.dateText ||
+    after.lastDateText !== before.lastDateText ||
+    after.firstRow !== before.firstRow ||
+    after.lastRow !== before.lastRow
+  );
 }
 
 /**
@@ -856,12 +908,15 @@ async function readPageDateRange(
 
   if (texts.length === 0) return null;
 
+  // Tolerate individual unparseable headers (section labels and other
+  // non-date containers share the class on some page variants); one bad
+  // header must not disable the seek for the whole walk.
   const times: number[] = [];
   for (const text of texts) {
     const parsed = parseDate(text);
-    if (!parsed) return null;
-    times.push(parsed.getTime());
+    if (parsed) times.push(parsed.getTime());
   }
+  if (times.length === 0) return null;
   return { newest: Math.max(...times), oldest: Math.min(...times) };
 }
 
@@ -911,13 +966,7 @@ async function goToNextPage(page: Page): Promise<NextPageResult> {
         const after = await readPageSignature(page).catch(
           () => null as PageSignature | null,
         );
-        if (
-          after &&
-          after.rowCount > 0 &&
-          (!before ||
-            after.dateText !== before.dateText ||
-            after.firstRow !== before.firstRow)
-        ) {
+        if (signatureChanged(before, after)) {
           return { advanced: true, reason: "advanced" };
         }
       }
@@ -932,16 +981,49 @@ async function goToNextPage(page: Page): Promise<NextPageResult> {
     return { advanced: false, reason: "click_no_transition" };
   }
 
-  // Legacy infinite-scroll layout: scroll the last item into view
+  // Legacy infinite-scroll layout: scroll to load more, then WAIT for
+  // the list to actually grow. (This branch previously returned success
+  // unconditionally after a 500ms pause, so walks on scroll-variant
+  // pages "advanced" through unchanged content until the stable guard
+  // stopped them far from the target window.)
   const lastTransaction = page
     .locator('[data-testid="transaction-link"], .transactions-line-item')
     .last();
 
   const exists = await lastTransaction.count().catch(() => 0);
   if (exists > 0) {
-    await lastTransaction.scrollIntoViewIfNeeded().catch(() => {});
-    await page.waitForTimeout(500);
-    return { advanced: true, reason: "legacy_scroll" };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = await readPageSignature(page).catch(
+        () => null as PageSignature | null,
+      );
+      await lastTransaction.scrollIntoViewIfNeeded().catch(() => {});
+      await page
+        .evaluate(() => {
+          const w = globalThis as unknown as {
+            scrollTo: (x: number, y: number) => void;
+            document: { body: { scrollHeight: number } };
+          };
+          w.scrollTo(0, w.document.body.scrollHeight);
+        })
+        .catch(() => {});
+
+      const deadline = Date.now() + APX_PAGE_TRANSITION_TIMEOUT_MS;
+      let grew = false;
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(300);
+        const after = await readPageSignature(page).catch(
+          () => null as PageSignature | null,
+        );
+        if (signatureChanged(before, after)) {
+          grew = true;
+          break;
+        }
+      }
+      if (grew) {
+        return { advanced: true, reason: "legacy_scroll" };
+      }
+    }
+    return { advanced: false, reason: "scroll_no_growth" };
   }
 
   return { advanced: false, reason: "no_next_control" };
