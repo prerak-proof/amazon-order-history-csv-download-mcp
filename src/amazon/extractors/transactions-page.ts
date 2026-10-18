@@ -60,6 +60,8 @@ export interface TransactionsWalkDiagnostics {
   errorWidgetSeen: boolean;
   /** Pagination-surface census captured on turn failure (walk's own page). */
   census: unknown;
+  /** Times a failed turn/extraction recovered by the widget moving on its own. */
+  recoveries: number;
   trace: Array<{
     page: number;
     phase: "seek" | "extract";
@@ -79,6 +81,7 @@ export function newWalkDiagnostics(): TransactionsWalkDiagnostics {
     newestDate: null,
     errorWidgetSeen: false,
     census: null,
+    recoveries: 0,
     trace: [],
   };
 }
@@ -247,6 +250,25 @@ export async function extractTransactionsFromPage(
   // Give initial content time to render
   await page.waitForTimeout(1000);
 
+  // Keep the page "focused and active" for the whole walk. On some
+  // accounts the payments widget's state machine wedges when the page
+  // is treated as background/occluded (headless browsers throttle
+  // timers and rAF there): it renders the first chunk, then collapses
+  // to an empty list or cycles unpredictably. Focus emulation is the
+  // standard countermeasure; best effort only.
+  await page.bringToFront().catch(() => {});
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    await cdp
+      .send("Emulation.setFocusEmulationEnabled", { enabled: true })
+      .catch(() => {});
+    await cdp
+      .send("Page.setWebLifecycleState", { state: "active" })
+      .catch(() => {});
+  } catch {
+    // CDP unavailable (non-Chromium): proceed without emulation.
+  }
+
   let allTransactions: Transaction[] = [];
   let pageCount = 0;
   let previousCount = 0;
@@ -254,6 +276,31 @@ export async function extractTransactionsFromPage(
   const diag = options?.diagnostics;
   let stopReason = "page_cap";
   let stopDetail = `hit the ${maxScrolls}-page cap`;
+
+  // Recovery for self-cycling widgets: when a turn fails, the widget
+  // sometimes moves on its own seconds later (it re-renders in cycles
+  // on some accounts). Poll the signature undisturbed; if the tail
+  // moved, the walk can continue with the new page state.
+  let turnRecoveries = 0;
+  const waitForSelfMovement = async (): Promise<boolean> => {
+    if (turnRecoveries >= 10) return false;
+    const before = await readPageSignature(page).catch(
+      () => null as PageSignature | null,
+    );
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(1000);
+      const after = await readPageSignature(page).catch(
+        () => null as PageSignature | null,
+      );
+      if (signatureChanged(before, after)) {
+        turnRecoveries++;
+        if (diag) diag.recoveries++;
+        return true;
+      }
+    }
+    return false;
+  };
 
   // The transactions page is paginated (Previous/Next page buttons).
   // Walk pages until there's no enabled Next button, we pass the start date,
@@ -286,6 +333,10 @@ export async function extractTransactionsFromPage(
         }
         const adv = await goToNextPage(page);
         if (!adv.advanced) {
+          if (await waitForSelfMovement()) {
+            pageCount++;
+            continue;
+          }
           stopReason = "no_next_page";
           stopDetail = `seek phase: ${adv.reason}`;
           break;
@@ -296,7 +347,18 @@ export async function extractTransactionsFromPage(
     }
 
     // Extract current transactions
-    const pageTransactions = await extractVisibleTransactions(page, currency);
+    let pageTransactions = await extractVisibleTransactions(page, currency);
+
+    if (pageTransactions.length === 0) {
+      // The widget may have momentarily collapsed to an empty list
+      // (observed live: 20 rows extracted, census minutes later showed
+      // 0). Give it time to re-render and retry before giving up.
+      for (let r = 0; r < 2 && pageTransactions.length === 0; r++) {
+        await page.waitForTimeout(8000);
+        pageTransactions = await extractVisibleTransactions(page, currency);
+        if (pageTransactions.length > 0 && diag) diag.recoveries++;
+      }
+    }
 
     if (pageTransactions.length === 0) {
       // Nothing extracted on this page - no point paginating further
@@ -335,6 +397,10 @@ export async function extractTransactionsFromPage(
       }
       const advSeek = await goToNextPage(page);
       if (!advSeek.advanced) {
+        if (await waitForSelfMovement()) {
+          pageCount++;
+          continue;
+        }
         stopReason = "no_next_page";
         stopDetail = `seek phase (extracted): ${advSeek.reason}`;
         break;
@@ -389,6 +455,10 @@ export async function extractTransactionsFromPage(
     // Move to the next page if there is one
     const adv = await goToNextPage(page);
     if (!adv.advanced) {
+      if (await waitForSelfMovement()) {
+        pageCount++;
+        continue;
+      }
       stopReason = "no_next_page";
       stopDetail = `extract phase: ${adv.reason}`;
       break;
@@ -1080,7 +1150,7 @@ async function goToNextPage(page: Page): Promise<NextPageResult> {
   // so: bring the button into view, click ONCE, then poll undisturbed
   // for up to 30s before trying again.
   const loadMore = page
-    .locator('button, [role="button"], a')
+    .locator('button:visible, [role="button"]:visible, a:visible')
     .filter({ hasText: /^\s*load more\s*$/i });
   const loadMoreCount = await loadMore.count().catch(() => 0);
   if (loadMoreCount > 0) {
