@@ -134,19 +134,20 @@ async function extractShipmentsStrategyA(
         delivered = parseDeliveryStatus(text || "");
       }
 
-      // Get status text from AZAD XPath
+      // Get status text from AZAD XPath. Bounded timeouts: a missing
+      // sub-element must fail fast, not burn the 30s default timeout.
       const statusText =
         (await box
           .locator(
             'xpath=.//div[contains(@class, "shipment-info-container")]//div[@class="a-row"]/span',
           )
           .first()
-          .textContent()
+          .textContent({ timeout: 1000 })
           .catch(() => "")) ||
         (await box
           .locator('[data-component="shipmentStatus"]')
           .first()
-          .textContent()
+          .textContent({ timeout: 1000 })
           .catch(() => ""));
 
       // Get tracking link using AZAD's XPaths
@@ -154,12 +155,12 @@ async function extractShipmentsStrategyA(
         (await box
           .locator('a[href*="/progress-tracker/"]')
           .first()
-          .getAttribute("href")
+          .getAttribute("href", { timeout: 1000 })
           .catch(() => "")) ||
         (await box
           .locator('a[href*="/ship-track"]')
           .first()
-          .getAttribute("href")
+          .getAttribute("href", { timeout: 1000 })
           .catch(() => ""));
 
       // Normalize tracking link
@@ -188,7 +189,7 @@ async function extractShipmentsStrategyA(
           'xpath=.//span[normalize-space(text())="Transactions"]/../../div[contains(@class, "expander")]//div[contains(@class, "a-row")]',
         )
         .first()
-        .textContent()
+        .textContent({ timeout: 1000 })
         .catch(() => "");
       if (transactionText) {
         // Parse "December 17, 2023 - Visa ending in 8489: $41.49" format
@@ -210,7 +211,7 @@ async function extractShipmentsStrategyA(
           'xpath=.//span[contains(text(), "Refund for this return")]/../../../../..//span',
         )
         .first()
-        .textContent()
+        .textContent({ timeout: 1000 })
         .catch(() => "");
       if (refundText) {
         refund = parseMoney(refundText, currency);
@@ -501,7 +502,9 @@ async function extractShipmentsStrategyB(
           .locator(".od-status-message, h4, .a-text-bold")
           .first();
         statusText =
-          (await statusMsgEl.textContent().catch(() => "")) || "";
+          (await statusMsgEl
+            .textContent({ timeout: 1000 })
+            .catch(() => "")) || "";
         if (!statusText) {
           statusText = (await statusEl.textContent().catch(() => "")) || "";
         }
@@ -622,7 +625,7 @@ async function extractShipmentsStrategy1(
         (await section
           .locator('a[href*="track"]')
           .first()
-          .getAttribute("href")
+          .getAttribute("href", { timeout: 1000 })
           .catch(() => "")) || "";
       const trackingIdMatch = trackingLink.match(/trackingId=([^&]+)/i);
       const trackingId = trackingIdMatch ? trackingIdMatch[1] : "";
@@ -668,7 +671,7 @@ async function extractShipmentsStrategy2(
       const statusText = await section
         .locator('.a-color-success, .a-color-state, [class*="status"]')
         .first()
-        .textContent()
+        .textContent({ timeout: 1000 })
         .catch(() => "");
       const delivered = parseDeliveryStatus(statusText || "");
 
@@ -677,7 +680,7 @@ async function extractShipmentsStrategy2(
         (await section
           .locator('a[href*="track"]')
           .first()
-          .getAttribute("href")
+          .getAttribute("href", { timeout: 1000 })
           .catch(() => "")) || "";
       let trackingId = "";
 
@@ -685,7 +688,7 @@ async function extractShipmentsStrategy2(
       const trackingNumText = await section
         .locator(':text-matches("\\\\d{10,}")')
         .first()
-        .textContent()
+        .textContent({ timeout: 1000 })
         .catch(() => "");
       if (trackingNumText) {
         const match = trackingNumText.match(/\d{10,}/);
@@ -757,6 +760,13 @@ async function extractShipmentsStrategy3(
 export interface ExtractShipmentsOptions {
   /** Visit ship-track pages to get actual carrier tracking numbers (slower but complete) */
   fetchTrackingNumbers?: boolean;
+  /**
+   * Items already extracted for this order by the caller. When provided,
+   * the extractor does not run its own item extraction pass (callers such
+   * as fetchOrders have usually just extracted the same items from the
+   * invoice or detail page, and re-extracting them doubles the work).
+   */
+  items?: Item[];
 }
 
 /**
@@ -769,8 +779,8 @@ export async function extractShipments(
 ): Promise<Shipment[]> {
   const { fetchTrackingNumbers = false } = options;
 
-  // First, extract items for this order
-  const items = await extractItems(page, header);
+  // Use caller-provided items when available; extract only as a fallback.
+  const items = options.items ?? (await extractItems(page, header));
 
   // Try each extraction strategy (AZAD order: A, B, then fallbacks)
   const shipments = await firstMatchingStrategy<Shipment[]>(

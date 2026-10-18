@@ -18,6 +18,19 @@ import {
 } from "../amazon/extractors";
 import { extractFromInvoice } from "../amazon/extractors/invoice";
 import { getRegionByCode } from "../amazon/regions";
+import { TtlCache } from "../core/utils/memo-cache";
+
+/**
+ * Memoization for single-order fetches. A details call runs several page
+ * extractions; tools (and callers retrying after a slow response) often
+ * ask for the same order repeatedly within a short window. Successful
+ * results are cached for 10 minutes; callers must treat a returned
+ * result as read-only.
+ */
+export const singleOrderCache = new TtlCache<string, FetchOrdersResult>(
+  10 * 60 * 1000,
+  200,
+);
 
 /**
  * Parse invoice address lines into simple line1-line7 structure.
@@ -222,6 +235,22 @@ export async function fetchOrders(
   try {
     // If specific orderId requested, skip order list and go directly to invoice/detail
     if (orderId) {
+      const cacheKey = [
+        region,
+        orderId,
+        includeItems,
+        includeShipments,
+        includeTransactions,
+        fetchTrackingNumbers,
+        useInvoice,
+      ].join("|");
+      const cached = singleOrderCache.get(cacheKey);
+      if (cached) {
+        console.error(
+          `[fetch-orders] Single order cache hit: ${orderId} (region: ${region})`,
+        );
+        return cached;
+      }
       console.error(
         `[fetch-orders] Fetching single order: ${orderId} (region: ${region})`,
       );
@@ -405,7 +434,7 @@ export async function fetchOrders(
         }
 
         const shipments = await plugin
-          .extractShipments(page, header, fetchTrackingNumbers)
+          .extractShipments(page, header, fetchTrackingNumbers, result.items)
           .catch(() => []);
         enrichedOrder.shipments = shipments;
         result.shipments = shipments;
@@ -425,6 +454,10 @@ export async function fetchOrders(
 
       result.orders = [enrichedOrder];
       result.totalFound = 1;
+
+      if (result.errors.length === 0) {
+        singleOrderCache.set(cacheKey, result);
+      }
 
       return result;
     }
@@ -798,7 +831,7 @@ export async function fetchOrders(
                 )
                 .catch(() => {});
               const shipments = await plugin
-                .extractShipments(page, header, fetchTrackingNumbers)
+                .extractShipments(page, header, fetchTrackingNumbers, order.items)
                 .catch(() => []);
               result.shipments.push(...shipments);
               order.shipments = shipments;

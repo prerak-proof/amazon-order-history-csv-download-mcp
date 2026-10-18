@@ -428,13 +428,18 @@ export class AmazonPlugin extends BasePlatformPlugin {
   /**
    * Extract shipments from order detail page.
    * @param fetchTrackingNumbers - If true, visits ship-track pages to get actual carrier tracking numbers (slower)
+   * @param knownItems - Items already extracted for this order; when given, the shipments extractor reuses them instead of re-extracting
    */
   async extractShipments(
     page: Page,
     header: OrderHeader,
     fetchTrackingNumbers = false,
+    knownItems?: Item[],
   ): Promise<Shipment[]> {
-    return extractShipments(page, header, { fetchTrackingNumbers });
+    return extractShipments(page, header, {
+      fetchTrackingNumbers,
+      items: knownItems,
+    });
   }
 
   /**
