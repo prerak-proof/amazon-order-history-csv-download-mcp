@@ -997,15 +997,49 @@ async function goToNextPage(page: Page): Promise<NextPageResult> {
         () => null as PageSignature | null,
       );
       await lastTransaction.scrollIntoViewIfNeeded().catch(() => {});
+      // The list lives in its own scrollable container on this variant:
+      // scroll every scrollable ancestor of the rows (and the window),
+      // then wheel over the list — the widget loads more on those
+      // events, not on window scroll alone.
       await page
-        .evaluate(() => {
-          const w = globalThis as unknown as {
+        .evaluate((selector: string) => {
+          const browserWindow = globalThis as unknown as BrowserWindow & {
             scrollTo: (x: number, y: number) => void;
-            document: { body: { scrollHeight: number } };
+            document: BrowserDocument & { body: { scrollHeight: number } };
           };
-          w.scrollTo(0, w.document.body.scrollHeight);
-        })
+          const rows = browserWindow.document.querySelectorAll(selector);
+          const first = rows[0] as unknown as
+            | { parentElement: unknown }
+            | undefined;
+          let el = first?.parentElement as {
+            scrollHeight: number;
+            clientHeight: number;
+            scrollTop: number;
+            parentElement: unknown;
+          } | null;
+          while (el) {
+            if (el.scrollHeight > el.clientHeight) {
+              el.scrollTop = el.scrollHeight;
+            }
+            el = el.parentElement as typeof el;
+          }
+          browserWindow.scrollTo(
+            0,
+            browserWindow.document.body.scrollHeight,
+          );
+        }, APX_TRANSACTION_SELECTOR)
         .catch(() => {});
+      const box = await page
+        .locator(APX_TRANSACTION_SELECTOR)
+        .first()
+        .boundingBox()
+        .catch(() => null);
+      if (box) {
+        await page.mouse
+          .move(box.x + box.width / 2, box.y + box.height / 2)
+          .catch(() => {});
+        await page.mouse.wheel(0, 6000).catch(() => {});
+      }
 
       const deadline = Date.now() + APX_PAGE_TRANSITION_TIMEOUT_MS;
       let grew = false;
