@@ -88,6 +88,39 @@ describe("APX transactions-page extraction", () => {
     });
   });
 
+  it("seeks past pages entirely newer than the requested window", async () => {
+    if (!browser) return;
+
+    await page.route("**/cpe/yourpayments/transactions**", async (route) => {
+      const requestUrl = new URL(route.request().url());
+      const step = requestUrl.searchParams.get("step") || "1";
+      const body =
+        step === "1"
+          ? transactionPage(
+              "28 June 2026",
+              "111-1111111-1111111",
+              "-$10.00",
+              "/cpe/yourpayments/transactions?step=2",
+            )
+          : transactionPage("27 June 2026", "222-2222222-2222222", "-$20.00");
+      await route.fulfill({ contentType: "text/html", body });
+    });
+
+    const transactions = await extractTransactionsFromPage(page, "au", {
+      startDate: new Date("2026-06-26T00:00:00Z"),
+      endDate: new Date("2026-06-27T23:59:59Z"),
+      maxScrolls: 5,
+    });
+
+    // The 28 June page is entirely newer than the window: it is seeked
+    // past without being collected; only the 27 June transaction lands.
+    expect(transactions).toHaveLength(1);
+    expect(transactions[0]).toMatchObject({
+      orderIds: ["222-2222222-2222222"],
+      amount: { amount: -20.0, currency: "AUD" },
+    });
+  });
+
   it("stops when an enabled next control does not change the page", async () => {
     if (!browser) return;
 

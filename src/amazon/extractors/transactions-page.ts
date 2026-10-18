@@ -107,9 +107,36 @@ export async function extractTransactionsFromPage(
   // The transactions page is paginated (Previous/Next page buttons).
   // Walk pages until there's no enabled Next button, we pass the start date,
   // or we hit the page limit (reuses maxScrolls as a page cap).
+  //
+  // Seek phase: while a page lies entirely NEWER than the requested end
+  // date, only its date headers are read and the page is skipped without
+  // extracting or merging transactions. This makes deep history walks
+  // (e.g. asking for 2024 while the first page shows 2026) proportional to
+  // page turns instead of full extractions of every intervening page.
   while (pageCount < maxScrolls) {
+    if (endDate) {
+      const range = await readPageDateRange(page);
+      if (range && range.oldest > endDate.getTime()) {
+        const advanced = await goToNextPage(page);
+        if (!advanced) {
+          break;
+        }
+        pageCount++;
+        continue;
+      }
+    }
+
     // Extract current transactions
     const pageTransactions = await extractVisibleTransactions(page, currency);
+
+    if (pageTransactions.length === 0) {
+      // Nothing extracted on this page - no point paginating further
+      break;
+    }
+
+    const pageOldest = Math.min(
+      ...pageTransactions.map((t) => t.date.getTime()),
+    );
 
     // Merge with existing (deduplicate)
     allTransactions = mergeTransactions(allTransactions, pageTransactions);
@@ -118,11 +145,6 @@ export async function extractTransactionsFromPage(
       `Found ${allTransactions.length} transactions...`,
       allTransactions.length,
     );
-
-    if (pageTransactions.length === 0) {
-      // Nothing extracted on this page - no point paginating further
-      break;
-    }
 
     // Stop if nothing new turned up for several rounds (guards the legacy
     // infinite-scroll path, which has no reliable "last page" signal)
@@ -136,15 +158,10 @@ export async function extractTransactionsFromPage(
     }
     previousCount = allTransactions.length;
 
-    // Check date range - stop if we've gone past the start date
-    // (transactions are listed newest-first)
-    if (startDate && allTransactions.length > 0) {
-      const oldestDate = Math.min(
-        ...allTransactions.map((t) => t.date.getTime()),
-      );
-      if (oldestDate < startDate.getTime()) {
-        break;
-      }
+    // Stop once a page reaches back past the start date (transactions are
+    // listed newest-first, so no later page can re-enter the window)
+    if (startDate && pageOldest < startDate.getTime()) {
+      break;
     }
 
     // Move to the next page if there is one
@@ -675,6 +692,62 @@ function parseTransactionText(
   };
 }
 
+interface PageSignature {
+  dateText: string;
+  firstRow: string;
+  rowCount: number;
+}
+
+/**
+ * Cheap page fingerprint used to detect a completed page transition:
+ * the first date header plus the first transaction row's text.
+ */
+async function readPageSignature(page: Page): Promise<PageSignature> {
+  return page.evaluate((selector: string) => {
+    const browserWindow = globalThis as unknown as BrowserWindow;
+    const dateEl = browserWindow.document.querySelectorAll(
+      ".apx-transaction-date-container",
+    )[0];
+    const rows = browserWindow.document.querySelectorAll(selector);
+    const first = rows[0];
+    return {
+      dateText: dateEl?.textContent?.trim() || "",
+      firstRow: first?.textContent?.trim() || "",
+      rowCount: rows.length,
+    };
+  }, APX_TRANSACTION_SELECTOR);
+}
+
+/**
+ * Date range covered by the currently rendered page, from its date
+ * headers alone (no transaction extraction). Returns null when the page
+ * has no APX date headers (legacy layouts) or an unparseable header.
+ */
+async function readPageDateRange(
+  page: Page,
+): Promise<{ newest: number; oldest: number } | null> {
+  const texts = await page
+    .evaluate(() => {
+      const browserWindow = globalThis as unknown as BrowserWindow;
+      return Array.from(
+        browserWindow.document.querySelectorAll(
+          ".apx-transaction-date-container",
+        ),
+      ).map((el) => el.textContent?.trim() || "");
+    })
+    .catch(() => [] as string[]);
+
+  if (texts.length === 0) return null;
+
+  const times: number[] = [];
+  for (const text of texts) {
+    const parsed = parseDate(text);
+    if (!parsed) return null;
+    times.push(parsed.getTime());
+  }
+  return { newest: Math.max(...times), oldest: Math.min(...times) };
+}
+
 /**
  * Advance to the next page of transactions.
  * Returns true if navigation happened, false if there is no next page.
@@ -682,6 +755,14 @@ function parseTransactionText(
  * The paginated page uses a form-submit button:
  *   <input name="ppw-widgetEvent:DefaultNextPageNavigationEvent:..." type="submit">
  * (disabled buttons have no such input / carry the disabled attribute).
+ * Clicking it swaps the list via XHR without a document navigation.
+ *
+ * Transition detection polls the page signature from Node instead of a
+ * single in-page waitForFunction: rAF-driven polling can stall in
+ * backgrounded/headless browser contexts, which previously made slow
+ * transitions look like failures and ended deep walks early. A click
+ * that produces no change is retried (up to 3 attempts) before giving
+ * up, so one swallowed click no longer terminates the walk.
  * Falls back to scrolling for legacy infinite-scroll layouts.
  */
 async function goToNextPage(page: Page): Promise<boolean> {
@@ -691,30 +772,40 @@ async function goToNextPage(page: Page): Promise<boolean> {
 
   const count = await nextButton.count().catch(() => 0);
   if (count > 0) {
-    const previousRows = (
-      await page.locator(APX_TRANSACTION_SELECTOR).allTextContents()
-    ).map((row) => row.trim());
-
-    try {
-      await nextButton.first().click({ noWaitAfter: true });
-      await page.waitForFunction(
-        (previous: { rows: string[]; selector: string }) => {
-          const browserWindow = globalThis as unknown as BrowserWindow;
-          const currentRows = Array.from(
-            browserWindow.document.querySelectorAll(previous.selector),
-          ).map((row) => row.textContent?.trim() || "");
-          return (
-            currentRows.length > 0 &&
-            currentRows.join("\n") !== previous.rows.join("\n")
-          );
-        },
-        { rows: previousRows, selector: APX_TRANSACTION_SELECTOR },
-        { timeout: APX_PAGE_TRANSITION_TIMEOUT_MS },
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = await readPageSignature(page).catch(
+        () => null as PageSignature | null,
       );
-      return true;
-    } catch {
-      return false;
+      await nextButton
+        .first()
+        .click({ noWaitAfter: true })
+        .catch(() => {});
+
+      const deadline = Date.now() + APX_PAGE_TRANSITION_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(300);
+        const after = await readPageSignature(page).catch(
+          () => null as PageSignature | null,
+        );
+        if (
+          after &&
+          after.rowCount > 0 &&
+          (!before ||
+            after.dateText !== before.dateText ||
+            after.firstRow !== before.firstRow)
+        ) {
+          return true;
+        }
+      }
+
+      // No visible change: if the button is gone the walk is over,
+      // otherwise retry the click (it may have been swallowed).
+      const stillThere = await nextButton.count().catch(() => 0);
+      if (stillThere === 0) {
+        return false;
+      }
     }
+    return false;
   }
 
   // Legacy infinite-scroll layout: scroll the last item into view
