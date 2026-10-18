@@ -58,6 +58,8 @@ export interface TransactionsWalkDiagnostics {
   deepestDate: string | null;
   newestDate: string | null;
   errorWidgetSeen: boolean;
+  /** Pagination-surface census captured on turn failure (walk's own page). */
+  census: unknown;
   trace: Array<{
     page: number;
     phase: "seek" | "extract";
@@ -76,6 +78,7 @@ export function newWalkDiagnostics(): TransactionsWalkDiagnostics {
     deepestDate: null,
     newestDate: null,
     errorWidgetSeen: false,
+    census: null,
     trace: [],
   };
 }
@@ -99,6 +102,92 @@ async function pageShowsErrorWidget(page: Page): Promise<boolean> {
       return (body.body?.innerText || "").includes("Something went wrong");
     })
     .catch(() => false);
+}
+
+/**
+ * Census of the page's pagination surface, captured on the walk's own
+ * page when a turn fails: pagination-ish controls (with visibility),
+ * ppw/page form inputs (names only), whatever follows the last
+ * transaction row, and any pagination containers. Page variants differ
+ * wildly (ppw Next input, scroll lists, other widgets), and a separate
+ * debug navigation does not reproduce the walk's page state — so the
+ * census has to be taken here, where the rows actually rendered.
+ */
+async function capturePaginationCensus(page: Page): Promise<unknown> {
+  return page
+    .evaluate(
+      `(() => {
+        const vis = (el) =>
+          Boolean(el.offsetParent || (el.getClientRects && el.getClientRects().length));
+        const txt = (el) =>
+          ((el.textContent || "") + "").replace(/\\s+/g, " ").trim().slice(0, 60);
+        const rows = document.querySelectorAll(
+          ".apx-transactions-line-item-component-container"
+        );
+        const controls = Array.from(
+          document.querySelectorAll(
+            'button, a, input[type="submit"], input[type="button"], [role="button"]'
+          )
+        )
+          .map((el) => ({
+            tag: el.tagName,
+            text: txt(el) || (el.getAttribute("value") || ""),
+            name: (el.getAttribute("name") || "").slice(0, 120),
+            cls: (el.getAttribute("class") || "").slice(0, 60),
+            disabled: Boolean(el.disabled),
+            visible: vis(el),
+          }))
+          .filter((c) =>
+            /next|previous|load more|show more|see more|older|page/i.test(
+              c.text + " " + c.name + " " + c.cls
+            )
+          );
+        const inputs = Array.from(document.querySelectorAll("input"))
+          .filter((el) => /ppw|page/i.test(el.getAttribute("name") || ""))
+          .map((el) => ({
+            name: (el.getAttribute("name") || "").slice(0, 120),
+            type: el.getAttribute("type") || "",
+            disabled: Boolean(el.disabled),
+            visible: vis(el),
+          }));
+        const sib = (el, mark) => {
+          const out = [];
+          let n = el ? el.nextElementSibling : null;
+          while (n && out.length < 5) {
+            out.push({
+              tag: n.tagName,
+              cls: (n.getAttribute("class") || "").slice(0, 60),
+              text: txt(n),
+              afterListContainer: Boolean(mark),
+            });
+            n = n.nextElementSibling;
+          }
+          return out;
+        };
+        const lastRow = rows[rows.length - 1];
+        let tail = [];
+        if (lastRow) {
+          tail = sib(lastRow, false);
+          if (lastRow.parentElement) {
+            tail.push(...sib(lastRow.parentElement, true));
+          }
+        }
+        const pagers = Array.from(
+          document.querySelectorAll(
+            '[class*="pagination"], [class*="pager"], [data-component*="pagination"]'
+          )
+        )
+          .slice(0, 6)
+          .map((el) => ({
+            tag: el.tagName,
+            cls: (el.getAttribute("class") || "").slice(0, 80),
+            text: txt(el),
+            visible: vis(el),
+          }));
+        return { rowCount: rows.length, controls, inputs, tail, pagers };
+      })()`,
+    )
+    .catch(() => null);
 }
 
 /**
@@ -310,6 +399,9 @@ export async function extractTransactionsFromPage(
   if (diag) {
     diag.stopReason = stopReason;
     diag.stopDetail = stopDetail;
+    if (stopReason === "no_next_page" || stopReason === "empty_extraction") {
+      diag.census = await capturePaginationCensus(page);
+    }
     console.error(
       `[transactions-page][diag] stop=${stopReason} (${stopDetail}); ` +
         `pagesVisited=${diag.pagesVisited} seekSkipped=${diag.seekPagesSkipped} ` +
