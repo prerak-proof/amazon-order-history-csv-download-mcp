@@ -44,6 +44,64 @@ const APX_TRANSACTION_SELECTOR =
 const APX_PAGE_TRANSITION_TIMEOUT_MS = 10000;
 
 /**
+ * Diagnostics for one transactions-page walk, filled in by
+ * extractTransactionsFromPage when the caller passes a diagnostics
+ * object in the options. Records where the walk went and exactly why
+ * it stopped — deep-history walks previously failed silently (0 rows,
+ * no reason), which made page-variant failures undebuggable.
+ */
+export interface TransactionsWalkDiagnostics {
+  pagesVisited: number;
+  seekPagesSkipped: number;
+  stopReason: string;
+  stopDetail: string;
+  deepestDate: string | null;
+  newestDate: string | null;
+  errorWidgetSeen: boolean;
+  trace: Array<{
+    page: number;
+    phase: "seek" | "extract";
+    newest: string | null;
+    oldest: string | null;
+    rows: number;
+  }>;
+}
+
+export function newWalkDiagnostics(): TransactionsWalkDiagnostics {
+  return {
+    pagesVisited: 0,
+    seekPagesSkipped: 0,
+    stopReason: "",
+    stopDetail: "",
+    deepestDate: null,
+    newestDate: null,
+    errorWidgetSeen: false,
+    trace: [],
+  };
+}
+
+function isoDay(time: number): string {
+  return new Date(time).toISOString().slice(0, 10);
+}
+
+/**
+ * Whether the payments widget is showing its "Something went wrong"
+ * error state (observed on some account page variants; the walk then
+ * turns pages that never render transactions).
+ */
+async function pageShowsErrorWidget(page: Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const browserWindow = globalThis as unknown as BrowserWindow;
+      const body = browserWindow.document as unknown as {
+        body?: { innerText?: string };
+      };
+      return (body.body?.innerText || "").includes("Something went wrong");
+    })
+    .catch(() => false);
+}
+
+/**
  * Parse an amount from the transactions page, trusting the region's currency.
  * The page always displays amounts in the region's currency, but bare "$"
  * symbols would otherwise be interpreted as USD (e.g. on amazon.com.au).
@@ -76,6 +134,7 @@ export async function extractTransactionsFromPage(
     endDate?: Date;
     maxScrolls?: number;
     onProgress?: (message: string, count: number) => void;
+    diagnostics?: TransactionsWalkDiagnostics;
   },
 ): Promise<Transaction[]> {
   const regionConfig = getRegionByCode(region);
@@ -103,6 +162,9 @@ export async function extractTransactionsFromPage(
   let pageCount = 0;
   let previousCount = 0;
   let stableCount = 0;
+  const diag = options?.diagnostics;
+  let stopReason = "page_cap";
+  let stopDetail = `hit the ${maxScrolls}-page cap`;
 
   // The transactions page is paginated (Previous/Next page buttons).
   // Walk pages until there's no enabled Next button, we pass the start date,
@@ -114,11 +176,29 @@ export async function extractTransactionsFromPage(
   // (e.g. asking for 2024 while the first page shows 2026) proportional to
   // page turns instead of full extractions of every intervening page.
   while (pageCount < maxScrolls) {
+    if (await pageShowsErrorWidget(page)) {
+      if (diag) diag.errorWidgetSeen = true;
+    }
+
     if (endDate) {
       const range = await readPageDateRange(page);
       if (range && range.oldest > endDate.getTime()) {
-        const advanced = await goToNextPage(page);
-        if (!advanced) {
+        if (diag) {
+          diag.seekPagesSkipped++;
+          diag.trace.push({
+            page: pageCount + 1,
+            phase: "seek",
+            newest: isoDay(range.newest),
+            oldest: isoDay(range.oldest),
+            rows: 0,
+          });
+          if (!diag.newestDate) diag.newestDate = isoDay(range.newest);
+          diag.deepestDate = isoDay(range.oldest);
+        }
+        const adv = await goToNextPage(page);
+        if (!adv.advanced) {
+          stopReason = "no_next_page";
+          stopDetail = `seek phase: ${adv.reason}`;
           break;
         }
         pageCount++;
@@ -131,12 +211,33 @@ export async function extractTransactionsFromPage(
 
     if (pageTransactions.length === 0) {
       // Nothing extracted on this page - no point paginating further
+      stopReason = "empty_extraction";
+      const sig = await readPageSignature(page).catch(() => null);
+      stopDetail =
+        `extraction returned 0 rows on page ${pageCount + 1} ` +
+        `(signature: date="${sig?.dateText ?? "?"}", rows=${sig?.rowCount ?? "?"}, ` +
+        `errorWidget=${diag?.errorWidgetSeen ?? false})`;
       break;
     }
 
     const pageOldest = Math.min(
       ...pageTransactions.map((t) => t.date.getTime()),
     );
+    const pageNewest = Math.max(
+      ...pageTransactions.map((t) => t.date.getTime()),
+    );
+    if (diag) {
+      diag.pagesVisited++;
+      diag.trace.push({
+        page: pageCount + 1,
+        phase: "extract",
+        newest: isoDay(pageNewest),
+        oldest: isoDay(pageOldest),
+        rows: pageTransactions.length,
+      });
+      if (!diag.newestDate) diag.newestDate = isoDay(pageNewest);
+      diag.deepestDate = isoDay(pageOldest);
+    }
 
     // Merge with existing (deduplicate)
     allTransactions = mergeTransactions(allTransactions, pageTransactions);
@@ -151,6 +252,8 @@ export async function extractTransactionsFromPage(
     if (allTransactions.length === previousCount) {
       stableCount++;
       if (stableCount >= 3) {
+        stopReason = "stable_no_new";
+        stopDetail = "3 consecutive pages added no new transactions";
         break;
       }
     } else {
@@ -161,15 +264,29 @@ export async function extractTransactionsFromPage(
     // Stop once a page reaches back past the start date (transactions are
     // listed newest-first, so no later page can re-enter the window)
     if (startDate && pageOldest < startDate.getTime()) {
+      stopReason = "reached_start_date";
+      stopDetail = `page oldest ${isoDay(pageOldest)} < start ${isoDay(startDate.getTime())}`;
       break;
     }
 
     // Move to the next page if there is one
-    const advanced = await goToNextPage(page);
-    if (!advanced) {
+    const adv = await goToNextPage(page);
+    if (!adv.advanced) {
+      stopReason = "no_next_page";
+      stopDetail = `extract phase: ${adv.reason}`;
       break;
     }
     pageCount++;
+  }
+
+  if (diag) {
+    diag.stopReason = stopReason;
+    diag.stopDetail = stopDetail;
+    console.error(
+      `[transactions-page][diag] stop=${stopReason} (${stopDetail}); ` +
+        `pagesVisited=${diag.pagesVisited} seekSkipped=${diag.seekPagesSkipped} ` +
+        `deepest=${diag.deepestDate} errorWidget=${diag.errorWidgetSeen}`,
+    );
   }
 
   // Drop rows scraped off Amazon error banners ("There was a problem")
@@ -750,7 +867,8 @@ async function readPageDateRange(
 
 /**
  * Advance to the next page of transactions.
- * Returns true if navigation happened, false if there is no next page.
+ * Reports whether navigation happened and, when it did not, why not
+ * (no control, vanished button, or clicks that produced no transition).
  *
  * The paginated page uses a form-submit button:
  *   <input name="ppw-widgetEvent:DefaultNextPageNavigationEvent:..." type="submit">
@@ -765,7 +883,13 @@ async function readPageDateRange(
  * up, so one swallowed click no longer terminates the walk.
  * Falls back to scrolling for legacy infinite-scroll layouts.
  */
-async function goToNextPage(page: Page): Promise<boolean> {
+interface NextPageResult {
+  advanced: boolean;
+  /** Machine-readable reason: advanced | legacy_scroll | click_no_transition | button_vanished | no_next_control */
+  reason: string;
+}
+
+async function goToNextPage(page: Page): Promise<NextPageResult> {
   const nextButton = page.locator(
     'input[name*="DefaultNextPageNavigationEvent"]:not([disabled])',
   );
@@ -794,7 +918,7 @@ async function goToNextPage(page: Page): Promise<boolean> {
             after.dateText !== before.dateText ||
             after.firstRow !== before.firstRow)
         ) {
-          return true;
+          return { advanced: true, reason: "advanced" };
         }
       }
 
@@ -802,10 +926,10 @@ async function goToNextPage(page: Page): Promise<boolean> {
       // otherwise retry the click (it may have been swallowed).
       const stillThere = await nextButton.count().catch(() => 0);
       if (stillThere === 0) {
-        return false;
+        return { advanced: false, reason: "button_vanished" };
       }
     }
-    return false;
+    return { advanced: false, reason: "click_no_transition" };
   }
 
   // Legacy infinite-scroll layout: scroll the last item into view
@@ -817,10 +941,10 @@ async function goToNextPage(page: Page): Promise<boolean> {
   if (exists > 0) {
     await lastTransaction.scrollIntoViewIfNeeded().catch(() => {});
     await page.waitForTimeout(500);
-    return true;
+    return { advanced: true, reason: "legacy_scroll" };
   }
 
-  return false;
+  return { advanced: false, reason: "no_next_control" };
 }
 
 /**

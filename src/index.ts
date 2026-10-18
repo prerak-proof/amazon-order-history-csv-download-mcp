@@ -36,7 +36,7 @@ import {
   downloadAmazonInvoice,
   isValidAmazonOrderId,
 } from "./tools";
-import { extractTransactionsFromPage } from "./amazon/extractors/transactions-page";
+import { extractTransactionsFromPage, newWalkDiagnostics } from "./amazon/extractors/transactions-page";
 import {
   extractGiftCardData,
   GiftCardData,
@@ -1385,6 +1385,7 @@ async function handleToolCall(request: CallToolRequest): Promise<{
         const endDate = args?.end_date as string | undefined;
         const maxScrolls = args?.max_scrolls as number | undefined;
 
+        const walkDiagnostics = newWalkDiagnostics();
         const transactions = await extractTransactionsFromPage(
           currentPage,
           region,
@@ -1392,6 +1393,7 @@ async function handleToolCall(request: CallToolRequest): Promise<{
             startDate: startDate ? new Date(startDate) : undefined,
             endDate: endDate ? new Date(endDate) : undefined,
             maxScrolls,
+            diagnostics: walkDiagnostics,
             onProgress: async (message, count) => {
               await sendProgress(progressToken, count, 0, message);
             },
@@ -1419,6 +1421,7 @@ async function handleToolCall(request: CallToolRequest): Promise<{
                     cardInfo: t.cardInfo,
                     vendor: t.vendor,
                   })),
+                  diagnostics: walkDiagnostics,
                 },
                 null,
                 2,
