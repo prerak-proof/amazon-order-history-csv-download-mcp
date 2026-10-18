@@ -518,12 +518,15 @@ async function extractShipmentsStrategyB(
             .textContent({ timeout: 1000 })
             .catch(() => "")) || "";
         if (!statusText) {
-          statusText = (await statusEl.textContent().catch(() => "")) || "";
+          statusText =
+            (await statusEl.textContent({ timeout: 1000 }).catch(() => "")) ||
+            "";
         }
       }
       statusText = statusText.replace(/\s+/g, " ").trim();
 
-      const groupText = (await group.textContent().catch(() => "")) || "";
+      const groupText =
+        (await group.textContent({ timeout: 1000 }).catch(() => "")) || "";
       const delivered = parseDeliveryStatus(statusText || groupText);
 
       // Tracking link scoped to this group
@@ -535,14 +538,20 @@ async function extractShipmentsStrategyB(
         .first();
       if ((await trackBtn.count().catch(() => 0)) > 0) {
         trackingLink =
-          (await trackBtn.getAttribute("href").catch(() => "")) || "";
+          (await trackBtn
+            .getAttribute("href", { timeout: 1000 })
+            .catch(() => "")) || "";
       }
       if (!trackingLink) {
+        // No anchor tracking link in this group is common (the track
+        // button is often JS-driven). This read MUST stay bounded: on an
+        // empty locator an unbounded getAttribute waits the full 30s
+        // default timeout — per group.
         trackingLink =
           (await group
             .locator('a[href*="/progress-tracker/"]')
             .first()
-            .getAttribute("href")
+            .getAttribute("href", { timeout: 1000 })
             .catch(() => "")) || "";
       }
       if (trackingLink && !trackingLink.startsWith("http")) {
