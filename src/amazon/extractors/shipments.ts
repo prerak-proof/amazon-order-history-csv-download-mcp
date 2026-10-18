@@ -454,16 +454,21 @@ async function extractShipmentsStrategyB(
   page: Page,
   header: OrderHeader,
   items: Item[],
+  timings?: Record<string, number>,
 ): Promise<Shipment[] | null> {
   const regionConfig = getRegionByCode(header.region);
   const currency = regionConfig?.currency || "USD";
 
+  const tContainers = Date.now();
   const containers = await page.locator('[data-component="shipments"]').all();
 
   const groupRoots: Locator[] = [];
+  let markingMs = 0;
   if (containers.length > 0) {
     for (const container of containers) {
+      const tMark = Date.now();
       await markShipmentGroups(container);
+      markingMs += Date.now() - tMark;
       const marked = await container
         .locator(`[${SHIPMENT_GROUP_ATTRIBUTE}]`)
         .all();
@@ -484,10 +489,17 @@ async function extractShipmentsStrategyB(
     groupRoots.push(...boxes);
   }
 
+  if (timings) {
+    timings.b_containersMs = Date.now() - tContainers - markingMs;
+    timings.b_markingMs = markingMs;
+    timings.b_groupCount = groupRoots.length;
+  }
+
   if (groupRoots.length === 0) return null;
 
   const shipments: Shipment[] = [];
 
+  const tGroupLoop = Date.now();
   for (let i = 0; i < groupRoots.length; i++) {
     const group = groupRoots[i];
 
@@ -573,6 +585,7 @@ async function extractShipmentsStrategyB(
       continue;
     }
   }
+  if (timings) timings.b_groupLoopMs = Date.now() - tGroupLoop;
 
   if (shipments.length === 0) return null;
 
@@ -813,7 +826,7 @@ export async function extractShipments(
   const shipments = await firstMatchingStrategy<Shipment[]>(
     [
       () => timed("strategyA", () => extractShipmentsStrategyA(page, header, items)), // AZAD's a-box.shipment
-      () => timed("strategyB", () => extractShipmentsStrategyB(page, header, items)), // AZAD's data-component 2024+
+      () => timed("strategyB", () => extractShipmentsStrategyB(page, header, items, options.strategyTimings)), // AZAD's data-component 2024+
       () => timed("strategy2", () => extractShipmentsStrategy2(page, header, items)), // Delivery status sections
       () => timed("strategy1", () => extractShipmentsStrategy1(page, header, items)), // Tracking sections
       () => timed("strategy3", () => extractShipmentsStrategy3(page, header, items)), // Fallback single shipment
