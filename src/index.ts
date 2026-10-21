@@ -7,7 +7,9 @@
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { createServer } from "node:http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   CallToolRequest,
@@ -19,6 +21,12 @@ import { chromium, BrowserContext, Page } from "playwright";
 import { z } from "zod";
 import { isAbsolute, join } from "path";
 import { homedir } from "os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  existsSync,
+  readFileSync,
+} from "node:fs";
 import packageMetadata from "../package.json";
 
 import { AmazonPlugin } from "./amazon/adapter";
@@ -36,7 +44,9 @@ import {
   downloadAmazonInvoice,
   isValidAmazonOrderId,
 } from "./tools";
-import { extractTransactionsFromPage, newWalkDiagnostics } from "./amazon/extractors/transactions-page";
+import { extractTransactionsFromPage, newWalkDiagnostics, getTransactionsPageUrl } from "./amazon/extractors/transactions-page";
+import { extractOrderCardTexts } from "./amazon/extractors/order-list";
+import { getInvoiceUrl } from "./amazon/extractors/invoice";
 import {
   extractGiftCardData,
   GiftCardData,
@@ -115,10 +125,11 @@ const BROWSER_DATA_DIR =
 async function getBrowserContext(): Promise<BrowserContext> {
   if (!browserContext) {
     const context = await chromium.launchPersistentContext(BROWSER_DATA_DIR, {
-      headless: false, // Need visible browser for login
+      channel: process.env.AMAZON_BROWSER_CHANNEL ?? "chromium",
+      headless:
+        (process.env.AMAZON_BROWSER_HEADLESS ?? "true").toLowerCase() ===
+        "true",
       viewport: { width: 1280, height: 800 },
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     });
     browserContext = context;
     // If the browser dies (crash, user closes the window, killed externally),
@@ -605,6 +616,116 @@ const tools: Tool[] = [
       required: ["region"],
     },
   },
+  {
+    name: "refresh_code",
+    description:
+      "Pull the latest MCP code from the configured repo/ref (AMAZON_MCP_REPO and AMAZON_MCP_REF, same as the container entrypoint uses) by running the entrypoint's own build step, then restart onto the new build. Only the configured repo/ref are ever fetched. Returns updated/already_current/error. Use after pushing new commits instead of asking for a container restart. The fetch plus TypeScript build can take a few minutes.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+    },
+  },
+  {
+    name: "debug_order_cards",
+    description:
+      "Return the raw text of order cards on the order history page for debugging extraction against live layouts (e.g. finding Subscribe & Save markers). Returns each card's order ID when identifiable plus its full card text, truncated per card. Read-only: loads the order history page but changes nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        region: {
+          type: "string",
+          description: "Amazon region code",
+          enum: getRegionCodes(),
+        },
+        year: {
+          type: "number",
+          description:
+            "Order history year to inspect (e.g., 2026). Defaults to the current year.",
+        },
+        max_cards: {
+          type: "number",
+          description:
+            "Maximum number of cards to return (1-50). Defaults to 10.",
+          default: 10,
+        },
+      },
+      required: ["region"],
+    },
+  },
+  {
+    name: "debug_order_details",
+    description:
+      "Return DOM diagnostics for one order's detail page (and optionally its invoice print page) for debugging extraction against live layouts: selector counts for every shipment/item strategy, a census of data-component attributes, the raw text of each shipments container, and per-element visibility for the invoice page components the invoice download waits on. Read-only: loads the order pages but changes nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        region: {
+          type: "string",
+          description: "Amazon region code",
+          enum: getRegionCodes(),
+        },
+        order_id: {
+          type: "string",
+          description: "Amazon order ID in format XXX-XXXXXXX-XXXXXXX",
+        },
+        include_invoice: {
+          type: "boolean",
+          description:
+            "Also load the invoice print page and report component visibility there. Defaults to true.",
+          default: true,
+        },
+      },
+      required: ["region", "order_id"],
+    },
+  },
+  {
+    name: "debug_transactions_page",
+    description:
+      "Return DOM diagnostics for the payments transactions page for debugging the history walk against live layouts: counts of transaction rows and date headers, every ppw/pagination form field (names and disabled state only, never field values), next/previous/load-more controls, the scrollable-ancestor chain of the transaction list, and what follows the last row. Read-only: loads the transactions page but changes nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        region: {
+          type: "string",
+          description: "Amazon region code",
+          enum: getRegionCodes(),
+        },
+      },
+      required: ["region"],
+    },
+  },
+  {
+    name: "debug_transactions_source",
+    description:
+      "Return source-level intel for the payments transactions page for debugging the history walk: the page's script bundle URLs, the Next.js __NEXT_DATA__ bootstrap JSON, the app root's HTML skeleton, the scroll container's metrics and HTML head, and keyword windows from the JS bundles around pagination terms (continueWidget, nextPageKey, onEndReached, fetchMore, cursor). Read-only: loads the transactions page but changes nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        region: {
+          type: "string",
+          description: "Amazon region code",
+          enum: getRegionCodes(),
+        },
+      },
+      required: ["region"],
+    },
+  },
+  {
+    name: "debug_transactions_capture",
+    description:
+      "Capture the transactions app's own pagination network traffic: loads the transactions page with request/response listeners attached, waits for the app to hydrate, then stimulates scrolling (window and every scrollable ancestor of the transaction rows) for ~25s while recording xhr/fetch requests and responses. Returns the captured calls (method, URL, request body, response status and body head) so the next-chunk request can be replayed directly. Read-only apart from the scrolling itself.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        region: {
+          type: "string",
+          description: "Amazon region code",
+          enum: getRegionCodes(),
+        },
+      },
+      required: ["region"],
+    },
+  },
 ];
 
 // Create server instance
@@ -822,6 +943,78 @@ async function handleInvoiceDownload(
   return {
     content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
     ...(result.success ? {} : { isError: true }),
+  };
+}
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Pull the latest MCP code and rebuild by delegating to the container
+ * entrypoint's --build flow (the same build start.sh runs on every
+ * container start), so the build logic lives in exactly one place. Only the
+ * repo/ref configured via AMAZON_MCP_REPO and AMAZON_MCP_REF are ever
+ * fetched — the tool takes no repository arguments. On success the new build
+ * is installed into /app and the process exits so the container restarts
+ * onto the new code.
+ */
+async function refreshCode(): Promise<{
+  status: "updated" | "already_current" | "error";
+  old_commit?: string | null;
+  new_commit?: string;
+  detail: string;
+}> {
+  const startScript = "/opt/amazon-start.sh";
+  if (!existsSync(startScript)) {
+    return {
+      status: "error",
+      detail:
+        "refresh_code requires the Synology container layout (/opt/amazon-start.sh not found)",
+    };
+  }
+
+  let currentCommit = "";
+  try {
+    currentCommit = readFileSync("/app/UPSTREAM_COMMIT", "utf8").trim();
+  } catch {
+    // No record of the running commit; treat as needing update.
+  }
+
+  try {
+    await execFileAsync("bash", [startScript, "--build"], {
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      timeout: 600000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+  } catch (error) {
+    return {
+      status: "error",
+      detail: `build failed: ${String(error).slice(0, 500)}`,
+    };
+  }
+
+  let newCommit = "";
+  try {
+    newCommit = readFileSync("/app/UPSTREAM_COMMIT", "utf8").trim();
+  } catch {
+    return { status: "error", detail: "build succeeded but UPSTREAM_COMMIT is missing" };
+  }
+  if (currentCommit && newCommit === currentCommit) {
+    return {
+      status: "already_current",
+      new_commit: currentCommit,
+      detail: "Already running the latest commit",
+    };
+  }
+
+  // Let the response flush, then exit so the container restarts onto the
+  // new build (start.sh re-fetches, which is a no-op, and launches it).
+  setTimeout(() => process.exit(0), 2000).unref();
+
+  return {
+    status: "updated",
+    old_commit: currentCommit || null,
+    new_commit: newCommit,
+    detail: "New code installed; server is restarting to pick it up",
   };
 }
 
@@ -1612,6 +1805,847 @@ async function handleToolCall(request: CallToolRequest): Promise<{
         };
       }
 
+      case "refresh_code": {
+        const result = await refreshCode();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+          ...(result.status === "error" ? { isError: true } : {}),
+        };
+      }
+
+      case "debug_order_cards": {
+        const regionParam = args?.region as string | undefined;
+        const regionError = validateRegion(regionParam, args);
+        if (regionError) return regionError;
+        const region = regionParam!;
+        const requestedYear =
+          (args?.year as number | undefined) ?? new Date().getFullYear();
+        const maxCards = Math.min(
+          Math.max((args?.max_cards as number | undefined) ?? 10, 1),
+          50,
+        );
+
+        const currentPage = await getPage();
+        const authStatus = await amazonPlugin.checkAuthStatus(
+          currentPage,
+          region,
+        );
+        if (!authStatus.authenticated) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "error",
+                    params: { region },
+                    error: `Not authenticated: ${authStatus.message}`,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const listUrl = amazonPlugin.getOrderListUrl(region, {
+          year: requestedYear,
+        });
+        await currentPage.goto(listUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 60000,
+        });
+        await currentPage
+          .waitForSelector('.order-card, [class*="order-card"], .a-box-group', {
+            timeout: 3000,
+          })
+          .catch(() => {});
+
+        const cards = await extractOrderCardTexts(currentPage);
+        const maxChars = 4000;
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "success",
+                  params: {
+                    region,
+                    year: requestedYear,
+                    max_cards: maxCards,
+                  },
+                  cards: cards.slice(0, maxCards).map((c) => ({
+                    orderId: c.orderId,
+                    text: c.text.slice(0, maxChars),
+                    truncated: c.text.length > maxChars,
+                  })),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      case "debug_order_details": {
+        const regionParam = args?.region as string | undefined;
+        const regionError = validateRegion(regionParam, args);
+        if (regionError) return regionError;
+        const region = regionParam!;
+        const orderId = args?.order_id as string;
+        const includeInvoice =
+          (args?.include_invoice as boolean | undefined) ?? true;
+
+        if (!orderId || !isValidAmazonOrderId(orderId)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "error",
+                    params: { region, order_id: orderId },
+                    error: "Invalid Amazon order ID",
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const currentPage = await getPage();
+        const authStatus = await amazonPlugin.checkAuthStatus(
+          currentPage,
+          region,
+        );
+        if (!authStatus.authenticated) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "error",
+                    params: { region, order_id: orderId },
+                    error: `Not authenticated: ${authStatus.message}`,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const detailUrl = amazonPlugin.getOrderDetailUrl(orderId, region);
+        await currentPage.goto(detailUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: 60000,
+        });
+        await currentPage
+          .waitForSelector(
+            '[data-component="orderDetails"], [data-component="shipments"], #od-subtotals, .order-details',
+            { timeout: 5000 },
+          )
+          .catch(() => {});
+
+        // String-form evaluate: this project's tsconfig has no DOM lib, so
+        // inline callbacks referencing document/window would not typecheck.
+        const detailDiagnostics = await currentPage.evaluate(
+          `(() => {
+            const count = (sel) => document.querySelectorAll(sel).length;
+            const census = {};
+            document.querySelectorAll("[data-component]").forEach((el) => {
+              const name = el.getAttribute("data-component") || "";
+              census[name] = (census[name] || 0) + 1;
+            });
+            const shipmentTexts = Array.from(
+              document.querySelectorAll('[data-component="shipments"]')
+            )
+              .slice(0, 8)
+              .map((el) => (el.innerText || "").slice(0, 1500));
+            const mainEl = document.querySelector(
+              '[data-component="orderDetails"]'
+            );
+            return {
+              url: window.location.href,
+              title: document.title,
+              counts: {
+                shipmentsComponent: count('[data-component="shipments"]'),
+                purchasedItems: count('[data-component="purchasedItems"]'),
+                shipmentStatus: count('[data-component="shipmentStatus"]'),
+                deliveryStatus: count('[data-component="deliveryStatus"]'),
+                chargeSummary: count('[data-component="chargeSummary"]'),
+                aBoxShipment: count("div.a-box.shipment"),
+                aBoxGroup: count(".a-box-group"),
+                fixedLeftGrid: count(".a-fixed-left-grid"),
+                fixedLeftGridInner: count("div.fixed-left-grid-inner"),
+                itemTitles: count('[data-component="itemTitle"]'),
+                orderDetailsProductLinks: count(
+                  '#orderDetails a[href*="/product/"], #orderDetails a[href*="/dp/"]'
+                ),
+              },
+              census,
+              shipmentTexts,
+              mainText: (
+                (mainEl && mainEl.innerText) ||
+                document.body.innerText ||
+                ""
+              ).slice(0, 6000),
+            };
+          })()`,
+        );
+
+        let invoiceDiagnostics: unknown = null;
+        if (includeInvoice) {
+          const domain = getRegionByCode(region)?.domain || "amazon.com";
+          const invoiceUrl = getInvoiceUrl(orderId, domain);
+          await currentPage
+            .goto(invoiceUrl, {
+              waitUntil: "domcontentloaded",
+              timeout: 60000,
+            })
+            .catch(() => {});
+          await currentPage.waitForTimeout(1500);
+          invoiceDiagnostics = await currentPage.evaluate(
+            `(() => {
+              const describe = (sel) =>
+                Array.from(document.querySelectorAll(sel)).map((el) => {
+                  const rect = el.getBoundingClientRect();
+                  const cs = window.getComputedStyle(el);
+                  return {
+                    tag: el.tagName,
+                    className: String(el.className || "").slice(0, 80),
+                    clientRects: el.getClientRects().length,
+                    rect: {
+                      width: Math.round(rect.width),
+                      height: Math.round(rect.height),
+                    },
+                    display: cs.display,
+                    visibility: cs.visibility,
+                    textStart: (el.innerText || "").slice(0, 150),
+                  };
+                });
+              return {
+                url: window.location.href,
+                title: document.title,
+                purchasedItems: describe('[data-component="purchasedItems"]'),
+                chargeSummary: describe('[data-component="chargeSummary"]'),
+                bodyTextStart: (document.body.innerText || "").slice(0, 2000),
+              };
+            })()`,
+          );
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "success",
+                  params: { region, order_id: orderId, includeInvoice },
+                  detail: detailDiagnostics,
+                  invoice: invoiceDiagnostics,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      case "debug_transactions_page": {
+        const regionParam = args?.region as string | undefined;
+        const regionError = validateRegion(regionParam, args);
+        if (regionError) return regionError;
+        const region = regionParam!;
+
+        const currentPage = await getPage();
+        const authStatus = await amazonPlugin.checkAuthStatus(
+          currentPage,
+          region,
+        );
+        if (!authStatus.authenticated) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "error",
+                    params: { region },
+                    error: `Not authenticated: ${authStatus.message}`,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        await currentPage.goto(getTransactionsPageUrl(region), {
+          waitUntil: "domcontentloaded",
+          timeout: 60000,
+        });
+        await currentPage
+          .waitForSelector(
+            ".apx-transactions-line-item-component-container",
+            { timeout: 20000 },
+          )
+          .catch(() => {});
+        await currentPage.waitForTimeout(2000);
+
+        // String-form evaluate: this project's tsconfig has no DOM lib, so
+        // inline callbacks referencing document/window would not typecheck.
+        const pageDiagnostics = (await currentPage.evaluate(
+          `(() => {
+            const visible = (el) =>
+              Boolean(el.offsetParent || (el.getClientRects && el.getClientRects().length));
+            const rows = document.querySelectorAll(
+              ".apx-transactions-line-item-component-container"
+            );
+            const dateHeaders = Array.from(
+              document.querySelectorAll(".apx-transaction-date-container")
+            ).map((el) => (el.textContent || "").trim());
+
+            const ppwInputs = Array.from(document.querySelectorAll("input"))
+              .filter((el) => /ppw|Page/i.test(el.getAttribute("name") || ""))
+              .map((el) => ({
+                name: (el.getAttribute("name") || "").slice(0, 140),
+                type: el.getAttribute("type") || "",
+                disabled: Boolean(el.disabled),
+                visible: visible(el),
+                valueLength: (el.getAttribute("value") || "").length,
+              }));
+
+            const forms = Array.from(document.querySelectorAll("form")).map(
+              (form) => ({
+                action: (form.getAttribute("action") || "").slice(0, 120),
+                method: form.getAttribute("method") || "",
+                fields: Array.from(form.querySelectorAll("input, select, textarea")).map(
+                  (el) => (el.getAttribute("name") || "").slice(0, 140)
+                ),
+              })
+            );
+            const ppwForms = forms.filter((f) =>
+              f.fields.some((n) => /ppw/i.test(n))
+            );
+
+            const navControls = Array.from(
+              document.querySelectorAll(
+                'button, a, input[type="submit"], input[type="button"], [role="button"]'
+              )
+            )
+              .map((el) => ({
+                tag: el.tagName,
+                text: ((el.textContent || el.getAttribute("value") || "") + "")
+                  .replace(/\\s+/g, " ")
+                  .trim()
+                  .slice(0, 60),
+                name: (el.getAttribute("name") || "").slice(0, 140),
+                disabled: Boolean(el.disabled),
+                visible: visible(el),
+              }))
+              .filter(
+                (c) =>
+                  /next|previous|load more|show more|see more|older/i.test(c.text) ||
+                  /NextPage|PreviousPage/i.test(c.name)
+              );
+
+            const scrollChain = [];
+            let node = rows[0];
+            for (let i = 0; node && i < 9; i++) {
+              const style = window.getComputedStyle(node);
+              scrollChain.push({
+                tag: node.tagName,
+                cls: (node.getAttribute("class") || "").slice(0, 70),
+                scrollHeight: node.scrollHeight,
+                clientHeight: node.clientHeight,
+                overflowY: style.overflowY,
+              });
+              node = node.parentElement;
+            }
+
+            const lastRow = rows[rows.length - 1];
+            const tailSiblings = [];
+            if (lastRow && lastRow.parentElement) {
+              const siblings = Array.from(lastRow.parentElement.children);
+              const idx = siblings.indexOf(lastRow);
+              for (const sib of siblings.slice(idx + 1, idx + 7)) {
+                tailSiblings.push({
+                  tag: sib.tagName,
+                  cls: (sib.getAttribute("class") || "").slice(0, 70),
+                  text: ((sib.textContent || "") + "")
+                    .replace(/\\s+/g, " ")
+                    .trim()
+                    .slice(0, 80),
+                });
+              }
+            }
+
+            let widgetFormHtml = "";
+            const widgetForm = Array.from(document.querySelectorAll("form")).find(
+              (form) =>
+                Array.from(form.querySelectorAll("input")).some((el) =>
+                  /ppw-widgetEvent/i.test(el.getAttribute("name") || "")
+                )
+            );
+            if (widgetForm) {
+              widgetFormHtml = widgetForm.outerHTML
+                .replace(/value="[^"]*"/g, 'value="[redacted]"')
+                .slice(0, 2500);
+            }
+
+            let loadMoreDetail = null;
+            const loadMoreEl = Array.from(
+              document.querySelectorAll('button, [role="button"], a')
+            ).find((el) =>
+              /^\\s*load more\\s*$/i.test(el.textContent || "")
+            );
+            if (loadMoreEl) {
+              const rect = loadMoreEl.getBoundingClientRect();
+              const style = window.getComputedStyle(loadMoreEl);
+              const chain = [];
+              let n = loadMoreEl;
+              for (let i = 0; n && i < 6; i++) {
+                chain.push({
+                  tag: n.tagName,
+                  cls: (n.getAttribute("class") || "").slice(0, 60),
+                });
+                n = n.parentElement;
+              }
+              loadMoreDetail = {
+                tag: loadMoreEl.tagName,
+                html: loadMoreEl.outerHTML
+                  .replace(/value="[^"]*"/g, 'value="[redacted]"')
+                  .slice(0, 500),
+                rect: {
+                  x: Math.round(rect.x),
+                  y: Math.round(rect.y),
+                  width: Math.round(rect.width),
+                  height: Math.round(rect.height),
+                },
+                display: style.display,
+                visibility: style.visibility,
+                disabled: Boolean(loadMoreEl.disabled),
+                chain,
+              };
+            }
+
+            return {
+              url: window.location.href,
+              title: document.title,
+              apxRowCount: rows.length,
+              dateHeaderCount: dateHeaders.length,
+              firstDateHeader: dateHeaders[0] || "",
+              lastDateHeader: dateHeaders[dateHeaders.length - 1] || "",
+              ppwInputs,
+              ppwForms,
+              formCount: forms.length,
+              navControls,
+              scrollChain,
+              tailSiblings,
+              widgetFormHtml,
+              loadMoreDetail,
+              bodyTextStart: (document.body.innerText || "").slice(0, 600),
+            };
+          })()`,
+        )) as { apxRowCount: number };
+
+        // Idle-growth probe: does the list load more rows by itself,
+        // given undisturbed time? (Read-only: no clicks, no scrolling.)
+        const rowsBeforeIdle = pageDiagnostics.apxRowCount;
+        await currentPage.waitForTimeout(15000);
+        const rowsAfterIdle = await currentPage
+          .evaluate(
+            `document.querySelectorAll(".apx-transactions-line-item-component-container").length`,
+          )
+          .catch(() => -1);
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "success",
+                  params: { region },
+                  page: pageDiagnostics,
+                  idleGrowth: { rowsBeforeIdle, rowsAfterIdle },
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      case "debug_transactions_source": {
+        const regionParam = args?.region as string | undefined;
+        const regionError = validateRegion(regionParam, args);
+        if (regionError) return regionError;
+        const region = regionParam!;
+
+        const currentPage = await getPage();
+        const authStatus = await amazonPlugin.checkAuthStatus(
+          currentPage,
+          region,
+        );
+        if (!authStatus.authenticated) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "error",
+                    params: { region },
+                    error: `Not authenticated: ${authStatus.message}`,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        await currentPage.goto(getTransactionsPageUrl(region), {
+          waitUntil: "domcontentloaded",
+          timeout: 60000,
+        });
+        await currentPage.waitForTimeout(2500);
+
+        // String-form evaluate: no DOM lib in this project's tsconfig.
+        const sourceIntel = (await currentPage.evaluate(
+          `(async () => {
+            const scripts = Array.from(
+              document.querySelectorAll("script[src]")
+            ).map((s) => s.getAttribute("src") || "");
+            const nextDataEl = document.querySelector("#__NEXT_DATA__");
+            const nextData = nextDataEl
+              ? (nextDataEl.textContent || "").slice(0, 20000)
+              : null;
+            const root =
+              document.querySelector("#__next") || document.body;
+            const rootHtml = root
+              ? root.outerHTML
+                  .replace(/value="[^"]*"/g, 'value="[redacted]"')
+                  .slice(0, 20000)
+              : "";
+            const container = document.querySelector(
+              "#__next > div:nth-child(1) > div > div.css-g5y9jx.r-13awgt0 > div > div"
+            );
+            const containerInfo = container
+              ? {
+                  scrollHeight: container.scrollHeight,
+                  clientHeight: container.clientHeight,
+                  scrollTop: container.scrollTop,
+                  childCount: container.children.length,
+                  html: container.outerHTML
+                    .replace(/value="[^"]*"/g, 'value="[redacted]"')
+                    .slice(0, 1500),
+                }
+              : null;
+            const rowsNow = document.querySelectorAll(
+              ".apx-transactions-line-item-component-container"
+            ).length;
+
+            const keywords = [
+              "continueWidget",
+              "nextPageKey",
+              "onEndReached",
+              "fetchMore",
+              "NextPageNavigation",
+              "cursor",
+            ];
+            const findings = [];
+            const bundleSrcs = scripts
+              .filter((s) => /transactions|_next|chunk|main/i.test(s))
+              .slice(0, 3);
+            for (const src of bundleSrcs) {
+              try {
+                const text = await fetch(src, {
+                  credentials: "include",
+                }).then((r) => r.text());
+                for (const kw of keywords) {
+                  let idx = text.indexOf(kw);
+                  let hits = 0;
+                  while (idx >= 0 && hits < 2) {
+                    findings.push({
+                      src: src.split("/").pop(),
+                      keyword: kw,
+                      window: text.slice(
+                        Math.max(0, idx - 220),
+                        idx + 320
+                      ),
+                    });
+                    idx = text.indexOf(kw, idx + kw.length);
+                    hits++;
+                  }
+                }
+                if (!findings.some((f) => f.src === src.split("/").pop())) {
+                  findings.push({
+                    src: src.split("/").pop(),
+                    keyword: "(none)",
+                    window:
+                      "bundle fetched, " +
+                      text.length +
+                      " chars, no keywords hit",
+                  });
+                }
+              } catch (e) {
+                findings.push({
+                  src: src.split("/").pop(),
+                  keyword: "(fetch failed)",
+                  window: String(e),
+                });
+              }
+            }
+
+            return {
+              url: window.location.href,
+              title: document.title,
+              scriptCount: scripts.length,
+              scripts: scripts.slice(0, 40),
+              nextData,
+              rootHtml,
+              containerInfo,
+              rowsNow,
+              findings: findings.slice(0, 40),
+            };
+          })()`,
+        )) as Record<string, unknown>;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "success",
+                  params: { region },
+                  source: sourceIntel,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      case "debug_transactions_capture": {
+        const regionParam = args?.region as string | undefined;
+        const regionError = validateRegion(regionParam, args);
+        if (regionError) return regionError;
+        const region = regionParam!;
+
+        const currentPage = await getPage();
+        const authStatus = await amazonPlugin.checkAuthStatus(
+          currentPage,
+          region,
+        );
+        if (!authStatus.authenticated) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    status: "error",
+                    params: { region },
+                    error: `Not authenticated: ${authStatus.message}`,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        // Record xhr/fetch traffic. Bodies are redacted for JWT-shaped
+        // tokens: the SHAPE of the app's next-chunk request is the
+        // goal; live tokens stay in the page, where a replay reads
+        // them fresh at drive time.
+        const redact = (text: string | null): string | null =>
+          text === null
+            ? null
+            : text
+                .replace(
+                  /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+                  "[jwt-redacted]",
+                )
+                .replace(
+                  /"(token|metricsToken|slateToken)"\s*:\s*"[^"]*"/g,
+                  '"$1":"[redacted]"',
+                );
+        interface CapturedRequest {
+          method: string;
+          url: string;
+          resourceType: string;
+          postData: string | null;
+          headers?: Record<string, string>;
+        }
+        interface CapturedResponse {
+          url: string;
+          status: number;
+          bodyHead: string | null;
+        }
+        const capturedRequests: CapturedRequest[] = [];
+        const capturedResponses: CapturedResponse[] = [];
+        const responseReads: Array<Promise<void>> = [];
+        let capturing = true;
+
+        currentPage.on("request", (req) => {
+          if (!capturing) return;
+          const type = req.resourceType();
+          if (type !== "xhr" && type !== "fetch") return;
+          if (capturedRequests.length >= 40) return;
+          // For the get-transactions call, also record header names and
+          // (redacted, truncated) values: the API rejected a cookie-only
+          // replay with 401, so the auth header it expects must be
+          // identified. Cookie header is dropped entirely.
+          let headers: Record<string, string> | undefined;
+          if (req.url().includes("get-transactions")) {
+            headers = {};
+            for (const [name, value] of Object.entries(req.headers())) {
+              if (name.toLowerCase() === "cookie") continue;
+              const redacted = redact(value) ?? value;
+              headers[name] =
+                redacted.length > 40
+                  ? `${redacted.slice(0, 24)}…[${redacted.length} chars]`
+                  : redacted;
+            }
+          }
+          capturedRequests.push({
+            method: req.method(),
+            url: req.url(),
+            resourceType: type,
+            postData: redact(req.postData())?.slice(0, 4000) ?? null,
+            headers,
+          });
+        });
+        currentPage.on("response", (res) => {
+          if (!capturing) return;
+          const type = res.request().resourceType();
+          if (type !== "xhr" && type !== "fetch") return;
+          responseReads.push(
+            res
+              .text()
+              .then((body) => {
+                if (capturedResponses.length < 40) {
+                  capturedResponses.push({
+                    url: res.url(),
+                    status: res.status(),
+                    bodyHead: redact(body)?.slice(0, 3500) ?? null,
+                  });
+                }
+              })
+              .catch(() => {}),
+          );
+        });
+
+        await currentPage.goto(getTransactionsPageUrl(region), {
+          waitUntil: "domcontentloaded",
+          timeout: 60000,
+        });
+        await currentPage
+          .waitForSelector('[data-testid="transaction-link"]', {
+            timeout: 15000,
+          })
+          .catch(() => {});
+        await currentPage.waitForTimeout(1000);
+
+        // Stimulate pagination the way the hydrated app expects: push
+        // every scrollable ancestor of the rows (and the window) to
+        // its bottom, repeatedly, so newly appended content keeps the
+        // end within reach of the next trigger.
+        const stimulator = (await currentPage.evaluate(
+          `(async () => {
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            const rowSel = '[data-testid="transaction-link"]';
+            const rowsCount = () => document.querySelectorAll(rowSel).length;
+            const before = rowsCount();
+            const scrollers = [];
+            const seen = new Set();
+            let el = document.querySelector(rowSel);
+            while (el && scrollers.length < 8) {
+              if (el.scrollHeight > el.clientHeight + 5 && !seen.has(el)) {
+                seen.add(el);
+                scrollers.push(el);
+              }
+              el = el.parentElement;
+            }
+            if (document.scrollingElement && !seen.has(document.scrollingElement)) {
+              scrollers.push(document.scrollingElement);
+            }
+            const info = scrollers.map((s) => ({
+              tag: s.tagName,
+              cls: (s.getAttribute("class") || "").slice(0, 60),
+              sh: s.scrollHeight,
+              ch: s.clientHeight,
+              oy: window.getComputedStyle(s).overflowY,
+            }));
+            for (let round = 0; round < 40; round++) {
+              for (const s of scrollers) {
+                s.scrollTop = s.scrollHeight;
+              }
+              window.scrollTo(0, document.body ? document.body.scrollHeight : 0);
+              await sleep(600);
+            }
+            return { rowsBefore: before, rowsAfter: rowsCount(), scrollers: info };
+          })()`,
+        )) as Record<string, unknown>;
+
+        await currentPage.waitForTimeout(3000);
+        await Promise.race([
+          Promise.allSettled(responseReads),
+          currentPage.waitForTimeout(5000),
+        ]);
+        capturing = false;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "success",
+                  params: { region },
+                  stimulator,
+                  requests: capturedRequests,
+                  responses: capturedResponses,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
       default:
         return {
           content: [
@@ -1657,9 +2691,89 @@ process.on("SIGTERM", async () => {
 
 // Main entry point
 async function main(): Promise<void> {
-  const transport = new StdioServerTransport();
+  const transportMode = (
+    process.env.MCP_TRANSPORT ?? "streamable-http"
+  ).toLowerCase();
+
+  if (transportMode === "stdio") {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error(
+      "Amazon Order History CSV Download MCP server running over stdio",
+    );
+    return;
+  }
+
+  if (transportMode !== "streamable-http" && transportMode !== "http") {
+    throw new Error(
+      `Unsupported MCP_TRANSPORT="${transportMode}". Use streamable-http or stdio.`,
+    );
+  }
+
+  const host = process.env.MCP_HOST ?? "0.0.0.0";
+  const port = Number.parseInt(process.env.MCP_PORT ?? "8000", 10);
+  const mcpPathRaw = process.env.MCP_PATH ?? "/mcp";
+  const mcpPath = mcpPathRaw.startsWith("/") ? mcpPathRaw : `/${mcpPathRaw}`;
+
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid MCP_PORT: ${process.env.MCP_PORT}`);
+  }
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+    enableJsonResponse: false,
+  });
   await server.connect(transport);
-  console.error("Amazon Order History CSV Download MCP server running");
+
+  const httpServer = createServer(async (req, res) => {
+    const requestUrl = new URL(
+      req.url ?? "/",
+      `http://${req.headers.host ?? "localhost"}`,
+    );
+
+    if (requestUrl.pathname === "/healthz") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+
+    if (requestUrl.pathname !== mcpPath) {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "not_found",
+          mcp_endpoint: mcpPath,
+        }),
+      );
+      return;
+    }
+
+    try {
+      await transport.handleRequest(req, res);
+    } catch (error) {
+      console.error("[mcp-http] request failed:", error);
+      if (!res.headersSent) {
+        res.writeHead(500, { "content-type": "application/json" });
+      }
+      if (!res.writableEnded) {
+        res.end(
+          JSON.stringify({
+            error: "mcp_transport_error",
+            message: String(error),
+          }),
+        );
+      }
+    }
+  });
+
+  httpServer.listen(port, host, () => {
+    console.error(
+      `Amazon Order History MCP listening at http://${host}:${port}${mcpPath}`,
+    );
+  });
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

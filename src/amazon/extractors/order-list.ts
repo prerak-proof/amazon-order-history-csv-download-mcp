@@ -812,6 +812,58 @@ async function extractOrderStatus(
 }
 
 /**
+ * One order card's raw text, for debugging extraction against live layouts.
+ */
+export interface OrderCardDebug {
+  orderId: string | null;
+  text: string;
+}
+
+/**
+ * Extract raw card texts from the current order-list page.
+ * Debug helper: returns each card's order ID (when identifiable) plus its
+ * full innerText, so new layouts and markers (e.g. Subscribe & Save) can be
+ * inspected without guessing at selectors.
+ */
+export async function extractOrderCardTexts(
+  page: Page,
+): Promise<OrderCardDebug[]> {
+  const results: OrderCardDebug[] = [];
+  const orderCards = await findOrderCards(page);
+  for (const card of orderCards) {
+    let text = "";
+    try {
+      text = await card.innerText({ timeout: 1000 });
+    } catch {
+      continue;
+    }
+    if (!text) continue;
+    let orderId: string | null = null;
+    const stdIdMatch = text.match(/ORDER\s*#?\s*(\d{3}-\d{7}-\d{7})/i);
+    if (stdIdMatch) {
+      orderId = stdIdMatch[1];
+    }
+    if (!orderId) {
+      const hexIdMatch = text.match(
+        /ORDER\s*#?\s*([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i,
+      );
+      if (hexIdMatch) {
+        orderId = hexIdMatch[1];
+      }
+    }
+    if (!orderId) {
+      try {
+        orderId = (await extractOrderId(card)) || null;
+      } catch {
+        orderId = null;
+      }
+    }
+    results.push({ orderId, text });
+  }
+  return results;
+}
+
+/**
  * Extract all order headers from the current page.
  */
 export async function extractOrderHeaders(
