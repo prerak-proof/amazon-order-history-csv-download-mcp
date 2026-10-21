@@ -315,6 +315,247 @@ export function getTransactionsPageUrl(region: string): string {
   return `https://www.${domain}/cpe/yourpayments/transactions`;
 }
 
+interface IrisRawTransaction {
+  dateText: string;
+  amountText: string;
+  orderIds: string[];
+  cardInfo: string;
+  vendor: string;
+  status: string;
+}
+
+interface IrisDriveResult {
+  transactions: Transaction[];
+  stopReason: string;
+  stopDetail: string;
+}
+
+/**
+ * Iris variant (the React Native Web payments app, e.g. Prerak's
+ * account): the transaction list is not DOM-paginated. The app boots
+ * with the first chunk embedded in __NEXT_DATA__ (state
+ * .transactionResponseState.visibleTransactionResponse
+ * .transactionList) alongside hasMore + lastEvaluatedPageKey, and
+ * fetches each next chunk from its own JSON endpoint —
+ * POST /payments-portal/data/iris/live/v1/data/manage/get-transactions
+ * with { exclusiveStartKey: <cursor> } in the body — a request shape
+ * captured verbatim from the app's own network traffic on 2026-10-20.
+ * Driving that endpoint from inside the page (the app's session and
+ * request shape, a gentle pace) replaces the scroll walk entirely on
+ * this variant: the hydrated app replaces the server-rendered DOM
+ * the walk reads, which is why DOM walks on this account only ever
+ * saw the first chunk and then an empty page.
+ *
+ * Returns null when the page is not this variant (no __NEXT_DATA__
+ * bootstrap state), so other layouts fall through to the DOM walk.
+ * Partial results are returned on mid-drive API errors, with the
+ * failure recorded in the stop reason.
+ */
+async function extractViaIrisApi(
+  page: Page,
+  currency: string,
+  startDate: Date | undefined,
+  diag: TransactionsWalkDiagnostics | undefined,
+): Promise<IrisDriveResult | null> {
+  const startIso = startDate ? isoDay(startDate.getTime()) : "1970-01-01";
+  const driven = (await page
+    .evaluate(
+      `(async () => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const notVariant = (stop) => ({ applicable: false, pages: 0, raw: [], stop });
+        const el = document.querySelector("#__NEXT_DATA__");
+        if (!el) return notVariant("no_next_data");
+        let boot;
+        try {
+          boot = JSON.parse(el.textContent || "{}");
+        } catch (e) {
+          return notVariant("bad_next_data");
+        }
+        const pp = (boot.props || {}).pageProps || {};
+        const trs = (pp.state || {}).transactionResponseState || {};
+        const visible = trs.visibleTransactionResponse || {};
+        if (!Array.isArray(visible.transactionList)) {
+          return notVariant("no_initial_list");
+        }
+        const token = typeof pp.token === "string" ? pp.token : null;
+
+        const mapTx = (t) => {
+          const pm = t.paymentMethodDisplayStringData || {};
+          const num = pm.paymentMethodNumber || {};
+          const orderIds = [];
+          for (const o of t.orderData || []) {
+            const m =
+              /(\\d{3}-\\d{7}-\\d{7})/.exec(o.orderDisplayString || "") ||
+              /orderID=([A-Z0-9-]+)/i.exec(o.orderDetailsUrl || "");
+            if (m) orderIds.push(m[1]);
+          }
+          return {
+            dateText: t.formattedDate || "",
+            amountText: t.formattedAmount || "",
+            orderIds,
+            cardInfo:
+              (pm.paymentMethodName || "") +
+              (num.lastDigits ? " ****" + num.lastDigits : ""),
+            vendor: t.statementDescriptor || "",
+            status: (t.statusInfo || {}).status || "",
+          };
+        };
+        const findKey = (obj, depth) => {
+          if (!obj || typeof obj !== "object" || depth > 6) return null;
+          if (typeof obj.lastEvaluatedKey === "string" && obj.lastEvaluatedKey) {
+            return obj.lastEvaluatedKey;
+          }
+          for (const k of Object.keys(obj)) {
+            const v = findKey(obj[k], depth + 1);
+            if (v) return v;
+          }
+          return null;
+        };
+        const oldestOf = (list) => {
+          let min = Infinity;
+          for (const t of list) {
+            const ms = Date.parse(t.formattedDate || "");
+            if (!isNaN(ms) && ms < min) min = ms;
+          }
+          return min;
+        };
+
+        const raw = visible.transactionList.map(mapTx);
+        const startMs = Date.parse("${startIso}T00:00:00");
+        let pages = 1;
+        let key =
+          typeof trs.lastEvaluatedPageKey === "string"
+            ? trs.lastEvaluatedPageKey
+            : null;
+        let hasMore = trs.hasMore !== false && Boolean(key);
+        let stop = "no_more";
+        if (hasMore && oldestOf(visible.transactionList) < startMs) {
+          stop = "window_covered";
+          hasMore = false;
+        }
+        const instanceId =
+          "A" +
+          Array.from(crypto.getRandomValues(new Uint8Array(16)))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join("");
+        while (hasMore && key) {
+          if (pages >= 100) {
+            stop = "cap";
+            break;
+          }
+          const body = {
+            type: "GetTransactions",
+            locale: "en_US",
+            surfaceInfo: {
+              surfaceType: "desktop",
+              clientApplicationType: "browser",
+              surfaceFeatures: [],
+              userAgent: navigator.userAgent,
+            },
+            applicationInstanceTraceId: instanceId,
+            transactionsViewRequest: {
+              filtersControls: { includeFilters: true },
+            },
+            exclusiveStartKey: key,
+            widgetName: "ViewTransactions",
+          };
+          const headers = { "Content-Type": "application/json" };
+          if (token) headers["Authorization"] = "Bearer " + token;
+          let resp;
+          try {
+            resp = await fetch(
+              "/payments-portal/data/iris/live/v1/data/manage/get-transactions",
+              {
+                method: "POST",
+                credentials: "include",
+                headers,
+                body: JSON.stringify(body),
+              }
+            );
+          } catch (e) {
+            return { applicable: true, pages, raw, stop: "fetch_error" };
+          }
+          if (!resp.ok) {
+            return { applicable: true, pages, raw, stop: "http_" + resp.status };
+          }
+          let json;
+          try {
+            json = await resp.json();
+          } catch (e) {
+            return { applicable: true, pages, raw, stop: "bad_json" };
+          }
+          if (json.responseCode !== "success") {
+            return {
+              applicable: true,
+              pages,
+              raw,
+              stop: "api_" + (json.responseCode || "unknown"),
+            };
+          }
+          const list = (json.displayResponse || {}).transactionsList || [];
+          raw.push(...list.map(mapTx));
+          pages++;
+          const nextKey = findKey(json, 0);
+          hasMore = Boolean(nextKey) && nextKey !== key;
+          key = nextKey;
+          if (!hasMore) {
+            stop = "no_more";
+            break;
+          }
+          if (list.length && oldestOf(list) < startMs) {
+            stop = "window_covered";
+            break;
+          }
+          await sleep(600);
+        }
+        return { applicable: true, pages, raw, stop };
+      })()`,
+    )
+    .catch(() => null)) as {
+    applicable: boolean;
+    pages: number;
+    raw: IrisRawTransaction[];
+    stop: string;
+  } | null;
+
+  if (!driven || !driven.applicable) return null;
+
+  const transactions: Transaction[] = [];
+  for (const rawTx of driven.raw) {
+    const date = parseDate(rawTx.dateText);
+    if (!date) continue;
+    transactions.push({
+      date,
+      orderIds: [...new Set(rawTx.orderIds)],
+      amount: parseRegionMoney(rawTx.amountText || "0", currency),
+      cardInfo: rawTx.cardInfo,
+      vendor: rawTx.vendor,
+      platformData: {
+        source: "transactions-page",
+        status: rawTx.status || undefined,
+        isRefund: rawTx.amountText.trim().startsWith("+"),
+      },
+    });
+  }
+
+  if (diag) {
+    diag.pagesVisited = driven.pages;
+    if (transactions.length) {
+      const times = transactions.map((t) => t.date.getTime());
+      diag.newestDate = isoDay(Math.max(...times));
+      diag.deepestDate = isoDay(Math.min(...times));
+    }
+  }
+  console.error(
+    `[transactions-page] iris drive: ${transactions.length} transactions over ${driven.pages} pages (stop=${driven.stop})`,
+  );
+  return {
+    transactions,
+    stopReason: `iris_${driven.stop}`,
+    stopDetail: `iris api drive: ${driven.pages} pages, stop=${driven.stop}`,
+  };
+}
+
 /**
  * Extract all transactions from the transactions page.
  * Uses page navigation for APX layouts and scrolling for legacy layouts.
@@ -391,6 +632,26 @@ export async function extractTransactionsFromPage(
   let stopReason = "page_cap";
   let stopDetail = `hit the ${maxScrolls}-page cap`;
 
+  // Iris variant first: if this page is the React Native Web app,
+  // drive its JSON endpoint directly and skip the DOM walk (the
+  // hydrated app replaces the DOM the walk reads, so the walk can
+  // only ever see the server-rendered first chunk on this variant).
+  const irisResult = await extractViaIrisApi(
+    page,
+    currency,
+    startDate,
+    diag,
+  ).catch(() => null);
+  if (irisResult) {
+    allTransactions = irisResult.transactions;
+    stopReason = irisResult.stopReason;
+    stopDetail = irisResult.stopDetail;
+    if (diag) {
+      diag.stopReason = stopReason;
+      diag.stopDetail = stopDetail;
+    }
+  }
+
   // Recovery for self-cycling widgets: when a turn fails, the widget
   // sometimes moves on its own seconds later (it re-renders in cycles
   // on some accounts). Poll the signature undisturbed; if the tail
@@ -425,7 +686,7 @@ export async function extractTransactionsFromPage(
   // extracting or merging transactions. This makes deep history walks
   // (e.g. asking for 2024 while the first page shows 2026) proportional to
   // page turns instead of full extractions of every intervening page.
-  while (pageCount < maxScrolls) {
+  while (!irisResult && pageCount < maxScrolls) {
     if (await pageShowsErrorWidget(page)) {
       if (diag) diag.errorWidgetSeen = true;
     }
@@ -580,7 +841,7 @@ export async function extractTransactionsFromPage(
     pageCount++;
   }
 
-  if (diag) {
+  if (diag && !irisResult) {
     diag.stopReason = stopReason;
     diag.stopDetail = stopDetail;
     if (stopReason === "no_next_page" || stopReason === "empty_extraction") {
