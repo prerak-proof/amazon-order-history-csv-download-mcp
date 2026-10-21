@@ -8,7 +8,7 @@
  * Based on AZAD's transaction.ts, transaction0.ts, and transaction1.ts patterns.
  */
 
-import { Page } from "playwright";
+import { Locator, Page } from "playwright";
 import { Transaction } from "../../core/types/transaction";
 import { parseMoney, getCurrencySymbol } from "../../core/types/money";
 import { parseDate } from "../../core/utils/date";
@@ -42,6 +42,68 @@ interface RawApxTransaction {
 const APX_TRANSACTION_SELECTOR =
   ".apx-transactions-line-item-component-container";
 const APX_PAGE_TRANSITION_TIMEOUT_MS = 10000;
+
+/**
+ * Selector for the transaction list's inner scroll container on the
+ * React Native Web variant of the payments page — read from the live
+ * DOM by Prerak (2026-10-20). The list is "a page within a page": the
+ * widget loads more only when THIS element scrolls, not the window.
+ * The hashed class names have been stable in his testing;
+ * resolveScrollContainer() falls back to the nearest scrollable
+ * ancestor of the rows when this matches nothing scrollable.
+ */
+const APX_SCROLL_CONTAINER_SELECTOR =
+  "#__next > div:nth-child(1) > div > div.css-g5y9jx.r-13awgt0 > div > div";
+
+/**
+ * Resolve the element that actually scrolls the APX transaction list.
+ * Returns a locator for the container, or null when no scrollable
+ * container can be identified.
+ */
+async function resolveScrollContainer(page: Page): Promise<Locator | null> {
+  const known = page.locator(APX_SCROLL_CONTAINER_SELECTOR);
+  const knownCount = await known.count().catch(() => 0);
+  if (knownCount > 0) {
+    const scrollable = await known
+      .first()
+      .evaluate(`(el) => el.scrollHeight > el.clientHeight + 10`)
+      .catch(() => false);
+    if (scrollable) return known.first();
+  }
+
+  // Fallback: mark the nearest ancestor of the first row that is a
+  // real scroller (overflowing, with overflow-y auto/scroll), then
+  // locate it by the marker attribute.
+  const marked = await page
+    .evaluate(
+      `(() => {
+        document
+          .querySelectorAll("[data-muse-scroll-container]")
+          .forEach((el) => el.removeAttribute("data-muse-scroll-container"));
+        const row = document.querySelector(
+          ".apx-transactions-line-item-component-container"
+        );
+        let el = row ? row.parentElement : null;
+        while (el) {
+          const style = window.getComputedStyle(el);
+          if (
+            el.scrollHeight > el.clientHeight + 10 &&
+            /(auto|scroll)/.test(style.overflowY)
+          ) {
+            el.setAttribute("data-muse-scroll-container", "1");
+            return true;
+          }
+          el = el.parentElement;
+        }
+        return false;
+      })()`,
+    )
+    .catch(() => false);
+  if (!marked) return null;
+  const fallback = page.locator('[data-muse-scroll-container="1"]');
+  const fallbackCount = await fallback.count().catch(() => 0);
+  return fallbackCount > 0 ? fallback.first() : null;
+}
 
 /**
  * Diagnostics for one transactions-page walk, filled in by
@@ -235,9 +297,22 @@ export async function extractTransactionsFromPage(
 
   const { startDate, endDate, maxScrolls = 50, onProgress } = options || {};
 
-  // Navigate to transactions page
+  // Navigate to transactions page — unless the browser is already
+  // sitting on it with rows loaded (e.g. Prerak left it open in
+  // noVNC). A fresh navigation on the scroll-list variant produces a
+  // page instance whose widget collapses within seconds, while the
+  // live, already-working instance keeps loading by hand. Reuse the
+  // live instance as-is.
   onProgress?.("Loading transactions page...", 0);
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+  const alreadyThere =
+    page.url().includes("/cpe/yourpayments/transactions") &&
+    (await page
+      .locator(APX_TRANSACTION_SELECTOR)
+      .count()
+      .catch(() => 0)) > 0;
+  if (!alreadyThere) {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+  }
 
   // Wait for transactions to load (current "apx" structure or legacy selectors)
   await page
@@ -1197,72 +1272,71 @@ async function goToNextPage(page: Page): Promise<NextPageResult> {
 
   const exists = await lastTransaction.count().catch(() => 0);
   if (exists > 0) {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const before = await readPageSignature(page).catch(
-        () => null as PageSignature | null,
-      );
-      await lastTransaction.scrollIntoViewIfNeeded().catch(() => {});
-      // The list lives in its own scrollable container on this variant:
-      // scroll every scrollable ancestor of the rows (and the window),
-      // then wheel over the list — the widget loads more on those
-      // events, not on window scroll alone.
-      await page
-        .evaluate((selector: string) => {
-          const browserWindow = globalThis as unknown as BrowserWindow & {
-            scrollTo: (x: number, y: number) => void;
-            document: BrowserDocument & { body: { scrollHeight: number } };
-          };
-          const rows = browserWindow.document.querySelectorAll(selector);
-          const first = rows[0] as unknown as
-            | { parentElement: unknown }
-            | undefined;
-          let el = first?.parentElement as {
-            scrollHeight: number;
-            clientHeight: number;
-            scrollTop: number;
-            parentElement: unknown;
-          } | null;
-          while (el) {
-            if (el.scrollHeight > el.clientHeight) {
-              el.scrollTop = el.scrollHeight;
-            }
-            el = el.parentElement as typeof el;
-          }
-          browserWindow.scrollTo(
-            0,
-            browserWindow.document.body.scrollHeight,
-          );
-        }, APX_TRANSACTION_SELECTOR)
-        .catch(() => {});
-      const box = await page
-        .locator(APX_TRANSACTION_SELECTOR)
-        .first()
-        .boundingBox()
-        .catch(() => null);
+    // The widget paginates off its INNER scroll container, not the
+    // window. Earlier approaches — jumping every scrollable ancestor
+    // to its bottom, wheeling over the first row, scrolling the outer
+    // page — never loaded a single extra chunk on this variant, and
+    // the list collapsed to empty under the churn. Instead: resolve
+    // the actual container and scroll it the way a person does, one
+    // viewport at a time with pauses, verifying growth as we go.
+    const container = await resolveScrollContainer(page);
+    if (!container) {
+      return { advanced: false, reason: "no_scroll_container" };
+    }
+    const before = await readPageSignature(page).catch(
+      () => null as PageSignature | null,
+    );
+    const box = await container.boundingBox().catch(() => null);
+
+    let lastScrollTop = -1;
+    let reachedBottom = false;
+    for (let step = 0; step < 15; step++) {
+      const state = (await container
+        .evaluate(
+          `(el) => {
+             el.scrollTop += el.clientHeight;
+             return {
+               top: el.scrollTop,
+               max: el.scrollHeight - el.clientHeight,
+             };
+           }`,
+        )
+        .catch(() => null)) as { top: number; max: number } | null;
       if (box) {
         await page.mouse
           .move(box.x + box.width / 2, box.y + box.height / 2)
           .catch(() => {});
-        await page.mouse.wheel(0, 6000).catch(() => {});
+        await page.mouse.wheel(0, 700).catch(() => {});
       }
+      await page.waitForTimeout(800);
 
+      const afterStep = await readPageSignature(page).catch(
+        () => null as PageSignature | null,
+      );
+      if (signatureChanged(before, afterStep)) {
+        return { advanced: true, reason: "container_scroll" };
+      }
+      if (state) {
+        reachedBottom = state.top >= state.max - 2;
+        if (reachedBottom && state.top === lastScrollTop) break;
+        lastScrollTop = state.top;
+      }
+    }
+
+    // At the bottom: give a slow final chunk time to arrive.
+    if (reachedBottom) {
       const deadline = Date.now() + APX_PAGE_TRANSITION_TIMEOUT_MS;
-      let grew = false;
       while (Date.now() < deadline) {
-        await page.waitForTimeout(300);
+        await page.waitForTimeout(500);
         const after = await readPageSignature(page).catch(
           () => null as PageSignature | null,
         );
         if (signatureChanged(before, after)) {
-          grew = true;
-          break;
+          return { advanced: true, reason: "container_scroll" };
         }
       }
-      if (grew) {
-        return { advanced: true, reason: "legacy_scroll" };
-      }
     }
-    return { advanced: false, reason: "scroll_no_growth" };
+    return { advanced: false, reason: "container_scroll_no_growth" };
   }
 
   return { advanced: false, reason: "no_next_control" };
