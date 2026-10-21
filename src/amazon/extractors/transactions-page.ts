@@ -179,7 +179,45 @@ async function pageShowsErrorWidget(page: Page): Promise<boolean> {
  * census has to be taken here, where the rows actually rendered.
  */
 async function capturePaginationCensus(page: Page): Promise<unknown> {
-  return page
+  // Scan EVERY page in the browser context first. The user may have
+  // the transactions page open in a different tab (noVNC) than the one
+  // this walk is driving: this walk's page can read empty while the
+  // user's tab is alive and full of rows, and the two states say
+  // nothing about each other. (Observed 2026-10-20: extraction read
+  // 20 rows, every later read on the walk's page read 0, while the
+  // user watched a healthy page in noVNC.)
+  const allPages: Array<{
+    url: string;
+    title: string;
+    apxRows: number;
+    hasScrollContainer: boolean;
+    isWalkPage: boolean;
+  }> = [];
+  try {
+    for (const p of page.context().pages()) {
+      const apxRows = (await p
+        .evaluate(
+          `document.querySelectorAll(".apx-transactions-line-item-component-container").length`,
+        )
+        .catch(() => -1)) as number;
+      const hasScrollContainer = (await p
+        .evaluate(
+          `(() => { const el = document.querySelector("${APX_SCROLL_CONTAINER_SELECTOR}"); return Boolean(el) && el.scrollHeight > el.clientHeight + 10; })()`,
+        )
+        .catch(() => false)) as boolean;
+      allPages.push({
+        url: p.url(),
+        title: await p.title().catch(() => ""),
+        apxRows,
+        hasScrollContainer,
+        isWalkPage: p === page,
+      });
+    }
+  } catch {
+    // Best effort: the single-page census below still runs.
+  }
+
+  const ownPage = await page
     .evaluate(
       `(() => {
         const vis = (el) =>
@@ -253,6 +291,7 @@ async function capturePaginationCensus(page: Page): Promise<unknown> {
       })()`,
     )
     .catch(() => null);
+  return { allPages, ownPage };
 }
 
 /**
