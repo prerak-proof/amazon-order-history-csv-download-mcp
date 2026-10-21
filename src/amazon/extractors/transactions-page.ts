@@ -460,7 +460,10 @@ async function extractViaIrisApi(
             widgetName: "ViewTransactions",
           };
           const headers = { "Content-Type": "application/json" };
-          if (token) headers["Authorization"] = "Bearer " + token;
+          // The app authenticates with its UPX widget token in this
+          // custom header (captured from its own traffic); a standard
+          // Authorization header gets a 401.
+          if (token) headers["x-amzn-upx-token"] = token;
           let resp;
           try {
             resp = await fetch(
