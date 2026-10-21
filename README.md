@@ -274,6 +274,27 @@ Verify if the browser session is authenticated before running exports.
 
 Returns authentication status, username if logged in, or login URL if not.
 
+## Browser idle timeout
+
+To release Chromium's memory between requests, the server closes its persistent
+browser context five minutes after the last tool call finishes. It leaves the MCP
+server running and uses the existing browser initialization code to reopen the
+same persistent profile on the next browser request.
+
+Set `AMAZON_BROWSER_IDLE_TIMEOUT_MS` in the MCP server's environment to override
+the default `300000` milliseconds; set `0` to disable automatic closing. Accepted
+values are integers from `0` through `2147483647`. Active tool calls, including
+long-running and overlapping extractions, are never interrupted by the idle timer.
+Tool listings do not keep Chromium open. Mouse and keyboard activity in the
+browser does not reset the MCP timer; disable it for longer interactive logins.
+
+Browser lifetime regression checks run without Amazon access or Chromium:
+
+```bash
+npm run build
+node tests/browser-idle.mjs dist/index.js
+```
+
 ## Timeouts & Large Order Histories
 
 When exporting large order histories (100+ orders), the extraction process can take several minutes. MCP clients typically have timeout limits that may need adjustment.

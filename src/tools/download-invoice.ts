@@ -89,7 +89,15 @@ export async function downloadAmazonInvoice(
   }
 
   try {
-    await page.waitForSelector(INVOICE_SELECTOR, { timeout: 5000 });
+    // state "attached", not the default "visible": on the print page the
+    // first matching component (chargeSummary) renders with a zero-height
+    // box under screen media, so a visibility wait can never succeed even
+    // though the invoice content is fully present. The order ID check
+    // below positively identifies the invoice before anything is saved.
+    await page.waitForSelector(INVOICE_SELECTOR, {
+      state: "attached",
+      timeout: 10000,
+    });
   } catch (error) {
     return {
       success: false,

@@ -8,7 +8,7 @@
  * Based on AZAD's transaction.ts, transaction0.ts, and transaction1.ts patterns.
  */
 
-import { Page } from "playwright";
+import { Locator, Page } from "playwright";
 import { Transaction } from "../../core/types/transaction";
 import { parseMoney, getCurrencySymbol } from "../../core/types/money";
 import { parseDate } from "../../core/utils/date";
@@ -44,6 +44,257 @@ const APX_TRANSACTION_SELECTOR =
 const APX_PAGE_TRANSITION_TIMEOUT_MS = 10000;
 
 /**
+ * Selector for the transaction list's inner scroll container on the
+ * React Native Web variant of the payments page — read from the live
+ * DOM by Prerak (2026-10-20). The list is "a page within a page": the
+ * widget loads more only when THIS element scrolls, not the window.
+ * The hashed class names have been stable in his testing;
+ * resolveScrollContainer() falls back to the nearest scrollable
+ * ancestor of the rows when this matches nothing scrollable.
+ */
+const APX_SCROLL_CONTAINER_SELECTOR =
+  "#__next > div:nth-child(1) > div > div.css-g5y9jx.r-13awgt0 > div > div";
+
+/**
+ * Resolve the element that actually scrolls the APX transaction list.
+ * Returns a locator for the container, or null when no scrollable
+ * container can be identified.
+ */
+async function resolveScrollContainer(page: Page): Promise<Locator | null> {
+  const known = page.locator(APX_SCROLL_CONTAINER_SELECTOR);
+  const knownCount = await known.count().catch(() => 0);
+  if (knownCount > 0) {
+    const scrollable = await known
+      .first()
+      .evaluate(`(el) => el.scrollHeight > el.clientHeight + 10`)
+      .catch(() => false);
+    if (scrollable) return known.first();
+  }
+
+  // Fallback: mark the nearest ancestor of the first row that is a
+  // real scroller (overflowing, with overflow-y auto/scroll), then
+  // locate it by the marker attribute.
+  const marked = await page
+    .evaluate(
+      `(() => {
+        document
+          .querySelectorAll("[data-muse-scroll-container]")
+          .forEach((el) => el.removeAttribute("data-muse-scroll-container"));
+        const row = document.querySelector(
+          ".apx-transactions-line-item-component-container"
+        );
+        let el = row ? row.parentElement : null;
+        while (el) {
+          const style = window.getComputedStyle(el);
+          if (
+            el.scrollHeight > el.clientHeight + 10 &&
+            /(auto|scroll)/.test(style.overflowY)
+          ) {
+            el.setAttribute("data-muse-scroll-container", "1");
+            return true;
+          }
+          el = el.parentElement;
+        }
+        return false;
+      })()`,
+    )
+    .catch(() => false);
+  if (!marked) return null;
+  const fallback = page.locator('[data-muse-scroll-container="1"]');
+  const fallbackCount = await fallback.count().catch(() => 0);
+  return fallbackCount > 0 ? fallback.first() : null;
+}
+
+/**
+ * Diagnostics for one transactions-page walk, filled in by
+ * extractTransactionsFromPage when the caller passes a diagnostics
+ * object in the options. Records where the walk went and exactly why
+ * it stopped — deep-history walks previously failed silently (0 rows,
+ * no reason), which made page-variant failures undebuggable.
+ */
+export interface TransactionsWalkDiagnostics {
+  pagesVisited: number;
+  seekPagesSkipped: number;
+  stopReason: string;
+  stopDetail: string;
+  deepestDate: string | null;
+  newestDate: string | null;
+  errorWidgetSeen: boolean;
+  /** Pagination-surface census captured on turn failure (walk's own page). */
+  census: unknown;
+  /** Times a failed turn/extraction recovered by the widget moving on its own. */
+  recoveries: number;
+  trace: Array<{
+    page: number;
+    phase: "seek" | "extract";
+    newest: string | null;
+    oldest: string | null;
+    rows: number;
+  }>;
+}
+
+export function newWalkDiagnostics(): TransactionsWalkDiagnostics {
+  return {
+    pagesVisited: 0,
+    seekPagesSkipped: 0,
+    stopReason: "",
+    stopDetail: "",
+    deepestDate: null,
+    newestDate: null,
+    errorWidgetSeen: false,
+    census: null,
+    recoveries: 0,
+    trace: [],
+  };
+}
+
+function isoDay(time: number): string {
+  return new Date(time).toISOString().slice(0, 10);
+}
+
+/**
+ * Whether the payments widget is showing its "Something went wrong"
+ * error state (observed on some account page variants; the walk then
+ * turns pages that never render transactions).
+ */
+async function pageShowsErrorWidget(page: Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const browserWindow = globalThis as unknown as BrowserWindow;
+      const body = browserWindow.document as unknown as {
+        body?: { innerText?: string };
+      };
+      return (body.body?.innerText || "").includes("Something went wrong");
+    })
+    .catch(() => false);
+}
+
+/**
+ * Census of the page's pagination surface, captured on the walk's own
+ * page when a turn fails: pagination-ish controls (with visibility),
+ * ppw/page form inputs (names only), whatever follows the last
+ * transaction row, and any pagination containers. Page variants differ
+ * wildly (ppw Next input, scroll lists, other widgets), and a separate
+ * debug navigation does not reproduce the walk's page state — so the
+ * census has to be taken here, where the rows actually rendered.
+ */
+async function capturePaginationCensus(page: Page): Promise<unknown> {
+  // Scan EVERY page in the browser context first. The user may have
+  // the transactions page open in a different tab (noVNC) than the one
+  // this walk is driving: this walk's page can read empty while the
+  // user's tab is alive and full of rows, and the two states say
+  // nothing about each other. (Observed 2026-10-20: extraction read
+  // 20 rows, every later read on the walk's page read 0, while the
+  // user watched a healthy page in noVNC.)
+  const allPages: Array<{
+    url: string;
+    title: string;
+    apxRows: number;
+    hasScrollContainer: boolean;
+    isWalkPage: boolean;
+  }> = [];
+  try {
+    for (const p of page.context().pages()) {
+      const apxRows = (await p
+        .evaluate(
+          `document.querySelectorAll(".apx-transactions-line-item-component-container").length`,
+        )
+        .catch(() => -1)) as number;
+      const hasScrollContainer = (await p
+        .evaluate(
+          `(() => { const el = document.querySelector("${APX_SCROLL_CONTAINER_SELECTOR}"); return Boolean(el) && el.scrollHeight > el.clientHeight + 10; })()`,
+        )
+        .catch(() => false)) as boolean;
+      allPages.push({
+        url: p.url(),
+        title: await p.title().catch(() => ""),
+        apxRows,
+        hasScrollContainer,
+        isWalkPage: p === page,
+      });
+    }
+  } catch {
+    // Best effort: the single-page census below still runs.
+  }
+
+  const ownPage = await page
+    .evaluate(
+      `(() => {
+        const vis = (el) =>
+          Boolean(el.offsetParent || (el.getClientRects && el.getClientRects().length));
+        const txt = (el) =>
+          ((el.textContent || "") + "").replace(/\\s+/g, " ").trim().slice(0, 60);
+        const rows = document.querySelectorAll(
+          ".apx-transactions-line-item-component-container"
+        );
+        const controls = Array.from(
+          document.querySelectorAll(
+            'button, a, input[type="submit"], input[type="button"], [role="button"]'
+          )
+        )
+          .map((el) => ({
+            tag: el.tagName,
+            text: txt(el) || (el.getAttribute("value") || ""),
+            name: (el.getAttribute("name") || "").slice(0, 120),
+            cls: (el.getAttribute("class") || "").slice(0, 60),
+            disabled: Boolean(el.disabled),
+            visible: vis(el),
+          }))
+          .filter((c) =>
+            /next|previous|load more|show more|see more|older|page/i.test(
+              c.text + " " + c.name + " " + c.cls
+            )
+          );
+        const inputs = Array.from(document.querySelectorAll("input"))
+          .filter((el) => /ppw|page/i.test(el.getAttribute("name") || ""))
+          .map((el) => ({
+            name: (el.getAttribute("name") || "").slice(0, 120),
+            type: el.getAttribute("type") || "",
+            disabled: Boolean(el.disabled),
+            visible: vis(el),
+          }));
+        const sib = (el, mark) => {
+          const out = [];
+          let n = el ? el.nextElementSibling : null;
+          while (n && out.length < 5) {
+            out.push({
+              tag: n.tagName,
+              cls: (n.getAttribute("class") || "").slice(0, 60),
+              text: txt(n),
+              afterListContainer: Boolean(mark),
+            });
+            n = n.nextElementSibling;
+          }
+          return out;
+        };
+        const lastRow = rows[rows.length - 1];
+        let tail = [];
+        if (lastRow) {
+          tail = sib(lastRow, false);
+          if (lastRow.parentElement) {
+            tail.push(...sib(lastRow.parentElement, true));
+          }
+        }
+        const pagers = Array.from(
+          document.querySelectorAll(
+            '[class*="pagination"], [class*="pager"], [data-component*="pagination"]'
+          )
+        )
+          .slice(0, 6)
+          .map((el) => ({
+            tag: el.tagName,
+            cls: (el.getAttribute("class") || "").slice(0, 80),
+            text: txt(el),
+            visible: vis(el),
+          }));
+        return { rowCount: rows.length, controls, inputs, tail, pagers };
+      })()`,
+    )
+    .catch(() => null);
+  return { allPages, ownPage };
+}
+
+/**
  * Parse an amount from the transactions page, trusting the region's currency.
  * The page always displays amounts in the region's currency, but bare "$"
  * symbols would otherwise be interpreted as USD (e.g. on amazon.com.au).
@@ -64,6 +315,250 @@ export function getTransactionsPageUrl(region: string): string {
   return `https://www.${domain}/cpe/yourpayments/transactions`;
 }
 
+interface IrisRawTransaction {
+  dateText: string;
+  amountText: string;
+  orderIds: string[];
+  cardInfo: string;
+  vendor: string;
+  status: string;
+}
+
+interface IrisDriveResult {
+  transactions: Transaction[];
+  stopReason: string;
+  stopDetail: string;
+}
+
+/**
+ * Iris variant (the React Native Web payments app, e.g. Prerak's
+ * account): the transaction list is not DOM-paginated. The app boots
+ * with the first chunk embedded in __NEXT_DATA__ (state
+ * .transactionResponseState.visibleTransactionResponse
+ * .transactionList) alongside hasMore + lastEvaluatedPageKey, and
+ * fetches each next chunk from its own JSON endpoint —
+ * POST /payments-portal/data/iris/live/v1/data/manage/get-transactions
+ * with { exclusiveStartKey: <cursor> } in the body — a request shape
+ * captured verbatim from the app's own network traffic on 2026-10-20.
+ * Driving that endpoint from inside the page (the app's session and
+ * request shape, a gentle pace) replaces the scroll walk entirely on
+ * this variant: the hydrated app replaces the server-rendered DOM
+ * the walk reads, which is why DOM walks on this account only ever
+ * saw the first chunk and then an empty page.
+ *
+ * Returns null when the page is not this variant (no __NEXT_DATA__
+ * bootstrap state), so other layouts fall through to the DOM walk.
+ * Partial results are returned on mid-drive API errors, with the
+ * failure recorded in the stop reason.
+ */
+async function extractViaIrisApi(
+  page: Page,
+  currency: string,
+  startDate: Date | undefined,
+  diag: TransactionsWalkDiagnostics | undefined,
+): Promise<IrisDriveResult | null> {
+  const startIso = startDate ? isoDay(startDate.getTime()) : "1970-01-01";
+  const driven = (await page
+    .evaluate(
+      `(async () => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const notVariant = (stop) => ({ applicable: false, pages: 0, raw: [], stop });
+        const el = document.querySelector("#__NEXT_DATA__");
+        if (!el) return notVariant("no_next_data");
+        let boot;
+        try {
+          boot = JSON.parse(el.textContent || "{}");
+        } catch (e) {
+          return notVariant("bad_next_data");
+        }
+        const pp = (boot.props || {}).pageProps || {};
+        const trs = (pp.state || {}).transactionResponseState || {};
+        const visible = trs.visibleTransactionResponse || {};
+        if (!Array.isArray(visible.transactionList)) {
+          return notVariant("no_initial_list");
+        }
+        const token = typeof pp.token === "string" ? pp.token : null;
+
+        const mapTx = (t) => {
+          const pm = t.paymentMethodDisplayStringData || {};
+          const num = pm.paymentMethodNumber || {};
+          const orderIds = [];
+          for (const o of t.orderData || []) {
+            const m =
+              /(\\d{3}-\\d{7}-\\d{7})/.exec(o.orderDisplayString || "") ||
+              /orderID=([A-Z0-9-]+)/i.exec(o.orderDetailsUrl || "");
+            if (m) orderIds.push(m[1]);
+          }
+          return {
+            dateText: t.formattedDate || "",
+            amountText: t.formattedAmount || "",
+            orderIds,
+            cardInfo:
+              (pm.paymentMethodName || "") +
+              (num.lastDigits ? " ****" + num.lastDigits : ""),
+            vendor: t.statementDescriptor || "",
+            status: (t.statusInfo || {}).status || "",
+          };
+        };
+        const findKey = (obj, depth) => {
+          if (!obj || typeof obj !== "object" || depth > 6) return null;
+          if (typeof obj.lastEvaluatedKey === "string" && obj.lastEvaluatedKey) {
+            return obj.lastEvaluatedKey;
+          }
+          for (const k of Object.keys(obj)) {
+            const v = findKey(obj[k], depth + 1);
+            if (v) return v;
+          }
+          return null;
+        };
+        const oldestOf = (list) => {
+          let min = Infinity;
+          for (const t of list) {
+            const ms = Date.parse(t.formattedDate || "");
+            if (!isNaN(ms) && ms < min) min = ms;
+          }
+          return min;
+        };
+
+        const raw = visible.transactionList.map(mapTx);
+        const startMs = Date.parse("${startIso}T00:00:00");
+        let pages = 1;
+        let key =
+          typeof trs.lastEvaluatedPageKey === "string"
+            ? trs.lastEvaluatedPageKey
+            : null;
+        let hasMore = trs.hasMore !== false && Boolean(key);
+        let stop = "no_more";
+        if (hasMore && oldestOf(visible.transactionList) < startMs) {
+          stop = "window_covered";
+          hasMore = false;
+        }
+        const instanceId =
+          "A" +
+          Array.from(crypto.getRandomValues(new Uint8Array(16)))
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join("");
+        while (hasMore && key) {
+          if (pages >= 100) {
+            stop = "cap";
+            break;
+          }
+          const body = {
+            type: "GetTransactions",
+            locale: "en_US",
+            surfaceInfo: {
+              surfaceType: "desktop",
+              clientApplicationType: "browser",
+              surfaceFeatures: [],
+              userAgent: navigator.userAgent,
+            },
+            applicationInstanceTraceId: instanceId,
+            transactionsViewRequest: {
+              filtersControls: { includeFilters: true },
+            },
+            exclusiveStartKey: key,
+            widgetName: "ViewTransactions",
+          };
+          const headers = { "Content-Type": "application/json" };
+          // The app authenticates with its UPX widget token in this
+          // custom header (captured from its own traffic); a standard
+          // Authorization header gets a 401.
+          if (token) headers["x-amzn-upx-token"] = token;
+          let resp;
+          try {
+            resp = await fetch(
+              "/payments-portal/data/iris/live/v1/data/manage/get-transactions",
+              {
+                method: "POST",
+                credentials: "include",
+                headers,
+                body: JSON.stringify(body),
+              }
+            );
+          } catch (e) {
+            return { applicable: true, pages, raw, stop: "fetch_error" };
+          }
+          if (!resp.ok) {
+            return { applicable: true, pages, raw, stop: "http_" + resp.status };
+          }
+          let json;
+          try {
+            json = await resp.json();
+          } catch (e) {
+            return { applicable: true, pages, raw, stop: "bad_json" };
+          }
+          if (json.responseCode !== "success") {
+            return {
+              applicable: true,
+              pages,
+              raw,
+              stop: "api_" + (json.responseCode || "unknown"),
+            };
+          }
+          const list = (json.displayResponse || {}).transactionsList || [];
+          raw.push(...list.map(mapTx));
+          pages++;
+          const nextKey = findKey(json, 0);
+          hasMore = Boolean(nextKey) && nextKey !== key;
+          key = nextKey;
+          if (!hasMore) {
+            stop = "no_more";
+            break;
+          }
+          if (list.length && oldestOf(list) < startMs) {
+            stop = "window_covered";
+            break;
+          }
+          await sleep(600);
+        }
+        return { applicable: true, pages, raw, stop };
+      })()`,
+    )
+    .catch(() => null)) as {
+    applicable: boolean;
+    pages: number;
+    raw: IrisRawTransaction[];
+    stop: string;
+  } | null;
+
+  if (!driven || !driven.applicable) return null;
+
+  const transactions: Transaction[] = [];
+  for (const rawTx of driven.raw) {
+    const date = parseDate(rawTx.dateText);
+    if (!date) continue;
+    transactions.push({
+      date,
+      orderIds: [...new Set(rawTx.orderIds)],
+      amount: parseRegionMoney(rawTx.amountText || "0", currency),
+      cardInfo: rawTx.cardInfo,
+      vendor: rawTx.vendor,
+      platformData: {
+        source: "transactions-page",
+        status: rawTx.status || undefined,
+        isRefund: rawTx.amountText.trim().startsWith("+"),
+      },
+    });
+  }
+
+  if (diag) {
+    diag.pagesVisited = driven.pages;
+    if (transactions.length) {
+      const times = transactions.map((t) => t.date.getTime());
+      diag.newestDate = isoDay(Math.max(...times));
+      diag.deepestDate = isoDay(Math.min(...times));
+    }
+  }
+  console.error(
+    `[transactions-page] iris drive: ${transactions.length} transactions over ${driven.pages} pages (stop=${driven.stop})`,
+  );
+  return {
+    transactions,
+    stopReason: `iris_${driven.stop}`,
+    stopDetail: `iris api drive: ${driven.pages} pages, stop=${driven.stop}`,
+  };
+}
+
 /**
  * Extract all transactions from the transactions page.
  * Uses page navigation for APX layouts and scrolling for legacy layouts.
@@ -76,6 +571,7 @@ export async function extractTransactionsFromPage(
     endDate?: Date;
     maxScrolls?: number;
     onProgress?: (message: string, count: number) => void;
+    diagnostics?: TransactionsWalkDiagnostics;
   },
 ): Promise<Transaction[]> {
   const regionConfig = getRegionByCode(region);
@@ -84,9 +580,22 @@ export async function extractTransactionsFromPage(
 
   const { startDate, endDate, maxScrolls = 50, onProgress } = options || {};
 
-  // Navigate to transactions page
+  // Navigate to transactions page — unless the browser is already
+  // sitting on it with rows loaded (e.g. Prerak left it open in
+  // noVNC). A fresh navigation on the scroll-list variant produces a
+  // page instance whose widget collapses within seconds, while the
+  // live, already-working instance keeps loading by hand. Reuse the
+  // live instance as-is.
   onProgress?.("Loading transactions page...", 0);
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+  const alreadyThere =
+    page.url().includes("/cpe/yourpayments/transactions") &&
+    (await page
+      .locator(APX_TRANSACTION_SELECTOR)
+      .count()
+      .catch(() => 0)) > 0;
+  if (!alreadyThere) {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+  }
 
   // Wait for transactions to load (current "apx" structure or legacy selectors)
   await page
@@ -99,17 +608,197 @@ export async function extractTransactionsFromPage(
   // Give initial content time to render
   await page.waitForTimeout(1000);
 
+  // Keep the page "focused and active" for the whole walk. On some
+  // accounts the payments widget's state machine wedges when the page
+  // is treated as background/occluded (headless browsers throttle
+  // timers and rAF there): it renders the first chunk, then collapses
+  // to an empty list or cycles unpredictably. Focus emulation is the
+  // standard countermeasure; best effort only.
+  await page.bringToFront().catch(() => {});
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    await cdp
+      .send("Emulation.setFocusEmulationEnabled", { enabled: true })
+      .catch(() => {});
+    await cdp
+      .send("Page.setWebLifecycleState", { state: "active" })
+      .catch(() => {});
+  } catch {
+    // CDP unavailable (non-Chromium): proceed without emulation.
+  }
+
   let allTransactions: Transaction[] = [];
   let pageCount = 0;
   let previousCount = 0;
   let stableCount = 0;
+  const diag = options?.diagnostics;
+  let stopReason = "page_cap";
+  let stopDetail = `hit the ${maxScrolls}-page cap`;
+
+  // Iris variant first: if this page is the React Native Web app,
+  // drive its JSON endpoint directly and skip the DOM walk (the
+  // hydrated app replaces the DOM the walk reads, so the walk can
+  // only ever see the server-rendered first chunk on this variant).
+  const irisResult = await extractViaIrisApi(
+    page,
+    currency,
+    startDate,
+    diag,
+  ).catch(() => null);
+  if (irisResult) {
+    allTransactions = irisResult.transactions;
+    stopReason = irisResult.stopReason;
+    stopDetail = irisResult.stopDetail;
+    if (diag) {
+      diag.stopReason = stopReason;
+      diag.stopDetail = stopDetail;
+    }
+  }
+
+  // Recovery for self-cycling widgets: when a turn fails, the widget
+  // sometimes moves on its own seconds later (it re-renders in cycles
+  // on some accounts). Poll the signature undisturbed; if the tail
+  // moved, the walk can continue with the new page state.
+  let turnRecoveries = 0;
+  const waitForSelfMovement = async (): Promise<boolean> => {
+    if (turnRecoveries >= 10) return false;
+    const before = await readPageSignature(page).catch(
+      () => null as PageSignature | null,
+    );
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(1000);
+      const after = await readPageSignature(page).catch(
+        () => null as PageSignature | null,
+      );
+      if (signatureChanged(before, after)) {
+        turnRecoveries++;
+        if (diag) diag.recoveries++;
+        return true;
+      }
+    }
+    return false;
+  };
 
   // The transactions page is paginated (Previous/Next page buttons).
   // Walk pages until there's no enabled Next button, we pass the start date,
   // or we hit the page limit (reuses maxScrolls as a page cap).
-  while (pageCount < maxScrolls) {
+  //
+  // Seek phase: while a page lies entirely NEWER than the requested end
+  // date, only its date headers are read and the page is skipped without
+  // extracting or merging transactions. This makes deep history walks
+  // (e.g. asking for 2024 while the first page shows 2026) proportional to
+  // page turns instead of full extractions of every intervening page.
+  while (!irisResult && pageCount < maxScrolls) {
+    if (await pageShowsErrorWidget(page)) {
+      if (diag) diag.errorWidgetSeen = true;
+    }
+
+    if (endDate) {
+      const range = await readPageDateRange(page);
+      if (range && range.oldest > endDate.getTime()) {
+        if (diag) {
+          diag.seekPagesSkipped++;
+          diag.trace.push({
+            page: pageCount + 1,
+            phase: "seek",
+            newest: isoDay(range.newest),
+            oldest: isoDay(range.oldest),
+            rows: 0,
+          });
+          if (!diag.newestDate) diag.newestDate = isoDay(range.newest);
+          diag.deepestDate = isoDay(range.oldest);
+        }
+        const adv = await goToNextPage(page);
+        if (!adv.advanced) {
+          if (await waitForSelfMovement()) {
+            pageCount++;
+            continue;
+          }
+          stopReason = "no_next_page";
+          stopDetail = `seek phase: ${adv.reason}`;
+          break;
+        }
+        pageCount++;
+        continue;
+      }
+    }
+
     // Extract current transactions
-    const pageTransactions = await extractVisibleTransactions(page, currency);
+    let pageTransactions = await extractVisibleTransactions(page, currency);
+
+    if (pageTransactions.length === 0) {
+      // The widget may have momentarily collapsed to an empty list
+      // (observed live: 20 rows extracted, census minutes later showed
+      // 0). Give it time to re-render and retry before giving up.
+      for (let r = 0; r < 2 && pageTransactions.length === 0; r++) {
+        await page.waitForTimeout(8000);
+        pageTransactions = await extractVisibleTransactions(page, currency);
+        if (pageTransactions.length > 0 && diag) diag.recoveries++;
+      }
+    }
+
+    if (pageTransactions.length === 0) {
+      // Nothing extracted on this page - no point paginating further
+      stopReason = "empty_extraction";
+      const sig = await readPageSignature(page).catch(() => null);
+      stopDetail =
+        `extraction returned 0 rows on page ${pageCount + 1} ` +
+        `(signature: date="${sig?.dateText ?? "?"}", rows=${sig?.rowCount ?? "?"}, ` +
+        `errorWidget=${diag?.errorWidgetSeen ?? false})`;
+      break;
+    }
+
+    const pageOldest = Math.min(
+      ...pageTransactions.map((t) => t.date.getTime()),
+    );
+    const pageNewest = Math.max(
+      ...pageTransactions.map((t) => t.date.getTime()),
+    );
+
+    // Seek fallback: the header-based range read can miss on some page
+    // variants; if the extracted page still lies entirely NEWER than
+    // the requested window, treat it as a seek page (do not merge, do
+    // not feed the stable counter) and keep moving.
+    if (endDate && pageOldest > endDate.getTime()) {
+      if (diag) {
+        diag.seekPagesSkipped++;
+        diag.trace.push({
+          page: pageCount + 1,
+          phase: "seek",
+          newest: isoDay(pageNewest),
+          oldest: isoDay(pageOldest),
+          rows: pageTransactions.length,
+        });
+        if (!diag.newestDate) diag.newestDate = isoDay(pageNewest);
+        diag.deepestDate = isoDay(pageOldest);
+      }
+      const advSeek = await goToNextPage(page);
+      if (!advSeek.advanced) {
+        if (await waitForSelfMovement()) {
+          pageCount++;
+          continue;
+        }
+        stopReason = "no_next_page";
+        stopDetail = `seek phase (extracted): ${advSeek.reason}`;
+        break;
+      }
+      pageCount++;
+      continue;
+    }
+
+    if (diag) {
+      diag.pagesVisited++;
+      diag.trace.push({
+        page: pageCount + 1,
+        phase: "extract",
+        newest: isoDay(pageNewest),
+        oldest: isoDay(pageOldest),
+        rows: pageTransactions.length,
+      });
+      if (!diag.newestDate) diag.newestDate = isoDay(pageNewest);
+      diag.deepestDate = isoDay(pageOldest);
+    }
 
     // Merge with existing (deduplicate)
     allTransactions = mergeTransactions(allTransactions, pageTransactions);
@@ -119,16 +808,13 @@ export async function extractTransactionsFromPage(
       allTransactions.length,
     );
 
-    if (pageTransactions.length === 0) {
-      // Nothing extracted on this page - no point paginating further
-      break;
-    }
-
     // Stop if nothing new turned up for several rounds (guards the legacy
     // infinite-scroll path, which has no reliable "last page" signal)
     if (allTransactions.length === previousCount) {
       stableCount++;
       if (stableCount >= 3) {
+        stopReason = "stable_no_new";
+        stopDetail = "3 consecutive pages added no new transactions";
         break;
       }
     } else {
@@ -136,23 +822,39 @@ export async function extractTransactionsFromPage(
     }
     previousCount = allTransactions.length;
 
-    // Check date range - stop if we've gone past the start date
-    // (transactions are listed newest-first)
-    if (startDate && allTransactions.length > 0) {
-      const oldestDate = Math.min(
-        ...allTransactions.map((t) => t.date.getTime()),
-      );
-      if (oldestDate < startDate.getTime()) {
-        break;
-      }
+    // Stop once a page reaches back past the start date (transactions are
+    // listed newest-first, so no later page can re-enter the window)
+    if (startDate && pageOldest < startDate.getTime()) {
+      stopReason = "reached_start_date";
+      stopDetail = `page oldest ${isoDay(pageOldest)} < start ${isoDay(startDate.getTime())}`;
+      break;
     }
 
     // Move to the next page if there is one
-    const advanced = await goToNextPage(page);
-    if (!advanced) {
+    const adv = await goToNextPage(page);
+    if (!adv.advanced) {
+      if (await waitForSelfMovement()) {
+        pageCount++;
+        continue;
+      }
+      stopReason = "no_next_page";
+      stopDetail = `extract phase: ${adv.reason}`;
       break;
     }
     pageCount++;
+  }
+
+  if (diag && !irisResult) {
+    diag.stopReason = stopReason;
+    diag.stopDetail = stopDetail;
+    if (stopReason === "no_next_page" || stopReason === "empty_extraction") {
+      diag.census = await capturePaginationCensus(page);
+    }
+    console.error(
+      `[transactions-page][diag] stop=${stopReason} (${stopDetail}); ` +
+        `pagesVisited=${diag.pagesVisited} seekSkipped=${diag.seekPagesSkipped} ` +
+        `deepest=${diag.deepestDate} errorWidget=${diag.errorWidgetSeen}`,
+    );
   }
 
   // Drop rows scraped off Amazon error banners ("There was a problem")
@@ -675,61 +1377,272 @@ function parseTransactionText(
   };
 }
 
+interface PageSignature {
+  dateText: string;
+  lastDateText: string;
+  firstRow: string;
+  lastRow: string;
+  rowCount: number;
+}
+
+/**
+ * Cheap page fingerprint used to detect a completed page transition:
+ * the first and last date headers plus the first and last transaction
+ * rows. Both ends matter: on the button-paginated variant a turn
+ * replaces the whole list (first row changes), while on the
+ * accumulating scroll variant the newest rows stay pinned and only
+ * the tail grows (row count and last row change).
+ */
+async function readPageSignature(page: Page): Promise<PageSignature> {
+  return page.evaluate((selector: string) => {
+    const browserWindow = globalThis as unknown as BrowserWindow;
+    const dateEls = browserWindow.document.querySelectorAll(
+      ".apx-transaction-date-container",
+    );
+    const rows = browserWindow.document.querySelectorAll(selector);
+    const first = rows[0];
+    const last = rows[rows.length - 1];
+    return {
+      dateText: dateEls[0]?.textContent?.trim() || "",
+      lastDateText: dateEls[dateEls.length - 1]?.textContent?.trim() || "",
+      firstRow: first?.textContent?.trim() || "",
+      lastRow: last?.textContent?.trim() || "",
+      rowCount: rows.length,
+    };
+  }, APX_TRANSACTION_SELECTOR);
+}
+
+function signatureChanged(
+  before: PageSignature | null,
+  after: PageSignature | null,
+): boolean {
+  if (!after || after.rowCount === 0) return false;
+  if (!before) return true;
+  return (
+    after.rowCount !== before.rowCount ||
+    after.dateText !== before.dateText ||
+    after.lastDateText !== before.lastDateText ||
+    after.firstRow !== before.firstRow ||
+    after.lastRow !== before.lastRow
+  );
+}
+
+/**
+ * Date range covered by the currently rendered page, from its date
+ * headers alone (no transaction extraction). Returns null when the page
+ * has no APX date headers (legacy layouts) or an unparseable header.
+ */
+async function readPageDateRange(
+  page: Page,
+): Promise<{ newest: number; oldest: number } | null> {
+  const texts = await page
+    .evaluate(() => {
+      const browserWindow = globalThis as unknown as BrowserWindow;
+      return Array.from(
+        browserWindow.document.querySelectorAll(
+          ".apx-transaction-date-container",
+        ),
+      ).map((el) => el.textContent?.trim() || "");
+    })
+    .catch(() => [] as string[]);
+
+  if (texts.length === 0) return null;
+
+  // Tolerate individual unparseable headers (section labels and other
+  // non-date containers share the class on some page variants); one bad
+  // header must not disable the seek for the whole walk.
+  const times: number[] = [];
+  for (const text of texts) {
+    const parsed = parseDate(text);
+    if (parsed) times.push(parsed.getTime());
+  }
+  if (times.length === 0) return null;
+  return { newest: Math.max(...times), oldest: Math.min(...times) };
+}
+
 /**
  * Advance to the next page of transactions.
- * Returns true if navigation happened, false if there is no next page.
+ * Reports whether navigation happened and, when it did not, why not
+ * (no control, vanished button, or clicks that produced no transition).
  *
  * The paginated page uses a form-submit button:
  *   <input name="ppw-widgetEvent:DefaultNextPageNavigationEvent:..." type="submit">
  * (disabled buttons have no such input / carry the disabled attribute).
+ * Clicking it swaps the list via XHR without a document navigation.
+ *
+ * Transition detection polls the page signature from Node instead of a
+ * single in-page waitForFunction: rAF-driven polling can stall in
+ * backgrounded/headless browser contexts, which previously made slow
+ * transitions look like failures and ended deep walks early. A click
+ * that produces no change is retried (up to 3 attempts) before giving
+ * up, so one swallowed click no longer terminates the walk.
  * Falls back to scrolling for legacy infinite-scroll layouts.
  */
-async function goToNextPage(page: Page): Promise<boolean> {
+interface NextPageResult {
+  advanced: boolean;
+  /** Machine-readable reason: advanced | legacy_scroll | click_no_transition | button_vanished | no_next_control */
+  reason: string;
+}
+
+async function goToNextPage(page: Page): Promise<NextPageResult> {
   const nextButton = page.locator(
     'input[name*="DefaultNextPageNavigationEvent"]:not([disabled])',
   );
 
   const count = await nextButton.count().catch(() => 0);
   if (count > 0) {
-    const previousRows = (
-      await page.locator(APX_TRANSACTION_SELECTOR).allTextContents()
-    ).map((row) => row.trim());
-
-    try {
-      await nextButton.first().click({ noWaitAfter: true });
-      await page.waitForFunction(
-        (previous: { rows: string[]; selector: string }) => {
-          const browserWindow = globalThis as unknown as BrowserWindow;
-          const currentRows = Array.from(
-            browserWindow.document.querySelectorAll(previous.selector),
-          ).map((row) => row.textContent?.trim() || "");
-          return (
-            currentRows.length > 0 &&
-            currentRows.join("\n") !== previous.rows.join("\n")
-          );
-        },
-        { rows: previousRows, selector: APX_TRANSACTION_SELECTOR },
-        { timeout: APX_PAGE_TRANSITION_TIMEOUT_MS },
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = await readPageSignature(page).catch(
+        () => null as PageSignature | null,
       );
-      return true;
-    } catch {
-      return false;
+      await nextButton
+        .first()
+        .click({ noWaitAfter: true })
+        .catch(() => {});
+
+      const deadline = Date.now() + APX_PAGE_TRANSITION_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(300);
+        const after = await readPageSignature(page).catch(
+          () => null as PageSignature | null,
+        );
+        if (signatureChanged(before, after)) {
+          return { advanced: true, reason: "advanced" };
+        }
+      }
+
+      // No visible change: if the button is gone the walk is over,
+      // otherwise retry the click (it may have been swallowed).
+      const stillThere = await nextButton.count().catch(() => 0);
+      if (stillThere === 0) {
+        return { advanced: false, reason: "button_vanished" };
+      }
     }
+    return { advanced: false, reason: "click_no_transition" };
   }
 
-  // Legacy infinite-scroll layout: scroll the last item into view
+  // "Load more" button variant (seen on some accounts instead of the
+  // ppw Next input): clicking it appends the next chunk of transactions.
+  // Chunk loads on this variant are slow (a live walk averaged ~14s per
+  // page), and repeated clicking/scrolling appears to restart the load —
+  // so: bring the button into view, click ONCE, then poll undisturbed
+  // for up to 30s before trying again.
+  const loadMore = page
+    .locator('button:visible, [role="button"]:visible, a:visible')
+    .filter({ hasText: /^\s*load more\s*$/i });
+  const loadMoreCount = await loadMore.count().catch(() => 0);
+  if (loadMoreCount > 0) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const before = await readPageSignature(page).catch(
+        () => null as PageSignature | null,
+      );
+      await loadMore
+        .first()
+        .scrollIntoViewIfNeeded({ timeout: 5000 })
+        .catch(() => {});
+      await loadMore
+        .first()
+        .click({ timeout: 5000, noWaitAfter: true })
+        .catch(() => {});
+
+      const deadline = Date.now() + 30000;
+      let grew = false;
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(500);
+        const after = await readPageSignature(page).catch(
+          () => null as PageSignature | null,
+        );
+        if (signatureChanged(before, after)) {
+          grew = true;
+          break;
+        }
+      }
+      if (grew) {
+        return { advanced: true, reason: "load_more" };
+      }
+    }
+    return { advanced: false, reason: "load_more_no_transition" };
+  }
+
+  // Legacy infinite-scroll layout: scroll to load more, then WAIT for
+  // the list to actually grow. (This branch previously returned success
+  // unconditionally after a 500ms pause, so walks on scroll-variant
+  // pages "advanced" through unchanged content until the stable guard
+  // stopped them far from the target window.)
   const lastTransaction = page
     .locator('[data-testid="transaction-link"], .transactions-line-item')
     .last();
 
   const exists = await lastTransaction.count().catch(() => 0);
   if (exists > 0) {
-    await lastTransaction.scrollIntoViewIfNeeded().catch(() => {});
-    await page.waitForTimeout(500);
-    return true;
+    // The widget paginates off its INNER scroll container, not the
+    // window. Earlier approaches — jumping every scrollable ancestor
+    // to its bottom, wheeling over the first row, scrolling the outer
+    // page — never loaded a single extra chunk on this variant, and
+    // the list collapsed to empty under the churn. Instead: resolve
+    // the actual container and scroll it the way a person does, one
+    // viewport at a time with pauses, verifying growth as we go.
+    const container = await resolveScrollContainer(page);
+    if (!container) {
+      return { advanced: false, reason: "no_scroll_container" };
+    }
+    const before = await readPageSignature(page).catch(
+      () => null as PageSignature | null,
+    );
+    const box = await container.boundingBox().catch(() => null);
+
+    let lastScrollTop = -1;
+    let reachedBottom = false;
+    for (let step = 0; step < 15; step++) {
+      const state = (await container
+        .evaluate(
+          `(el) => {
+             el.scrollTop += el.clientHeight;
+             return {
+               top: el.scrollTop,
+               max: el.scrollHeight - el.clientHeight,
+             };
+           }`,
+        )
+        .catch(() => null)) as { top: number; max: number } | null;
+      if (box) {
+        await page.mouse
+          .move(box.x + box.width / 2, box.y + box.height / 2)
+          .catch(() => {});
+        await page.mouse.wheel(0, 700).catch(() => {});
+      }
+      await page.waitForTimeout(800);
+
+      const afterStep = await readPageSignature(page).catch(
+        () => null as PageSignature | null,
+      );
+      if (signatureChanged(before, afterStep)) {
+        return { advanced: true, reason: "container_scroll" };
+      }
+      if (state) {
+        reachedBottom = state.top >= state.max - 2;
+        if (reachedBottom && state.top === lastScrollTop) break;
+        lastScrollTop = state.top;
+      }
+    }
+
+    // At the bottom: give a slow final chunk time to arrive.
+    if (reachedBottom) {
+      const deadline = Date.now() + APX_PAGE_TRANSITION_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(500);
+        const after = await readPageSignature(page).catch(
+          () => null as PageSignature | null,
+        );
+        if (signatureChanged(before, after)) {
+          return { advanced: true, reason: "container_scroll" };
+        }
+      }
+    }
+    return { advanced: false, reason: "container_scroll_no_growth" };
   }
 
-  return false;
+  return { advanced: false, reason: "no_next_control" };
 }
 
 /**

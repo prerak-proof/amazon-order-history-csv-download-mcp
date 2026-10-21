@@ -18,6 +18,19 @@ import {
 } from "../amazon/extractors";
 import { extractFromInvoice } from "../amazon/extractors/invoice";
 import { getRegionByCode } from "../amazon/regions";
+import { TtlCache } from "../core/utils/memo-cache";
+
+/**
+ * Memoization for single-order fetches. A details call runs several page
+ * extractions; tools (and callers retrying after a slow response) often
+ * ask for the same order repeatedly within a short window. Successful
+ * results are cached for 10 minutes; callers must treat a returned
+ * result as read-only.
+ */
+export const singleOrderCache = new TtlCache<string, FetchOrdersResult>(
+  10 * 60 * 1000,
+  200,
+);
 
 /**
  * Parse invoice address lines into simple line1-line7 structure.
@@ -93,6 +106,8 @@ export interface FetchOrdersResult {
   transactions: Transaction[];
   totalFound: number;
   errors: string[];
+  /** Stage timings in ms (single-order fetches only). */
+  timings?: Record<string, number>;
 }
 
 interface ParsedDateBound {
@@ -222,10 +237,29 @@ export async function fetchOrders(
   try {
     // If specific orderId requested, skip order list and go directly to invoice/detail
     if (orderId) {
+      const cacheKey = [
+        region,
+        orderId,
+        includeItems,
+        includeShipments,
+        includeTransactions,
+        fetchTrackingNumbers,
+        useInvoice,
+      ].join("|");
+      const cached = singleOrderCache.get(cacheKey);
+      if (cached) {
+        console.error(
+          `[fetch-orders] Single order cache hit: ${orderId} (region: ${region})`,
+        );
+        return cached;
+      }
       console.error(
         `[fetch-orders] Fetching single order: ${orderId} (region: ${region})`,
       );
       onProgress?.(`Fetching order ${orderId}...`, 0, 1);
+
+      const t0 = Date.now();
+      const timings: Record<string, number> = {};
 
       // Create header for this order
       const header: OrderHeader = {
@@ -240,7 +274,9 @@ export async function fetchOrders(
 
       const enrichedOrder: EnrichedOrder = { ...header };
 
+      const tInvoice = Date.now();
       const invoiceData = await extractFromInvoice(page, header);
+      timings.invoiceMs = Date.now() - tInvoice;
 
       // Check for error banners (e.g., "We're unable to load your order details")
       const errorBanner = await page
@@ -338,6 +374,7 @@ export async function fetchOrders(
       }
 
       // If no items found from invoice, try the detail page
+      const tDetailItems = Date.now();
       if (result.items.length === 0 && result.errors.length === 0) {
         console.error(
           `[fetch-orders] No items from invoice, trying detail page extraction`,
@@ -388,9 +425,12 @@ export async function fetchOrders(
         }
       }
 
+      timings.detailItemsMs = Date.now() - tDetailItems;
+
       // Get shipments from detail page if requested
       if (includeShipments) {
         console.error(`[fetch-orders] Fetching shipments from detail page`);
+        const tShipNav = Date.now();
         // Only navigate if not already there
         if (!page.url().includes("order-details")) {
           await page.goto(header.detailUrl, {
@@ -403,28 +443,53 @@ export async function fetchOrders(
             })
             .catch(() => {});
         }
+        timings.shipmentsNavMs = Date.now() - tShipNav;
 
+        const tShip = Date.now();
+        const shipStrategyTimings: Record<string, number> = {};
         const shipments = await plugin
-          .extractShipments(page, header, fetchTrackingNumbers)
+          .extractShipments(
+            page,
+            header,
+            fetchTrackingNumbers,
+            result.items,
+            shipStrategyTimings,
+          )
           .catch(() => []);
         enrichedOrder.shipments = shipments;
         result.shipments = shipments;
+        timings.shipmentsMs = Date.now() - tShip;
+        for (const [k, v] of Object.entries(shipStrategyTimings)) {
+          timings[`ship_${k}`] = v;
+        }
         console.error(`[fetch-orders] Found ${shipments.length} shipments`);
       }
 
       // Get transactions if requested
       if (includeTransactions) {
+        const tTxn = Date.now();
         const transactions = await plugin
           .extractTransactions(page, header)
           .catch(() => []);
         result.transactions = transactions;
+        timings.transactionsMs = Date.now() - tTxn;
         console.error(
           `[fetch-orders] Found ${transactions.length} transactions`,
         );
       }
 
+      timings.totalMs = Date.now() - t0;
+      result.timings = timings;
+      console.error(
+        `[fetch-orders][timing] ${orderId}: ${JSON.stringify(timings)}`,
+      );
+
       result.orders = [enrichedOrder];
       result.totalFound = 1;
+
+      if (result.errors.length === 0) {
+        singleOrderCache.set(cacheKey, result);
+      }
 
       return result;
     }
@@ -540,6 +605,26 @@ export async function fetchOrders(
         if (maxOrders && result.orders.length >= maxOrders) {
           reachedLimit = true;
           break;
+        }
+
+        // Date-bounded early termination: order list pages are
+        // reverse-chronological, so once the newest order on a page is older
+        // than startDate, no later page can contain in-range orders. Stop
+        // paginating instead of crawling the rest of the year.
+        if (isDateBounded && parsedStartDate && pageHeaders.length > 0) {
+          let newestOnPage: number | null = null;
+          for (const header of pageHeaders) {
+            if (header.date && !Number.isNaN(header.date.getTime())) {
+              const v = dateValue(header.date);
+              newestOnPage = newestOnPage === null ? v : Math.max(newestOnPage, v);
+            }
+          }
+          if (newestOnPage !== null && newestOnPage < parsedStartDate.value) {
+            console.error(
+              `[fetch-orders] Page ${pageNum} is entirely older than start date; stopping pagination.`,
+            );
+            break;
+          }
         }
 
         hasMore = await hasNextPage(page);
@@ -778,7 +863,7 @@ export async function fetchOrders(
                 )
                 .catch(() => {});
               const shipments = await plugin
-                .extractShipments(page, header, fetchTrackingNumbers)
+                .extractShipments(page, header, fetchTrackingNumbers, order.items)
                 .catch(() => []);
               result.shipments.push(...shipments);
               order.shipments = shipments;

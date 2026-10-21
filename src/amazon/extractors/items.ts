@@ -238,7 +238,7 @@ async function extractItemFromScope(
   };
 }
 
-async function extractItemsFromContainer(
+export async function extractItemsFromContainer(
   container: Locator,
   header: OrderHeader,
   currency: string,
@@ -614,7 +614,11 @@ export async function extractItems(
       debug(`Trying ${strategy.name}...`);
       const result = await Promise.race([
         strategy.fn(),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 1000)) // 1s timeout per strategy
+        // 3s per strategy: the data-component strategy does dozens of
+        // locator round-trips and legitimately needs >1s on a busy
+        // browser; at 1s it lost the race to legacy fallbacks that
+        // return garbage items from page chrome.
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000))
       ]);
       if (result && result.length > 0) {
         debug(`${strategy.name} found ${result.length} items`);

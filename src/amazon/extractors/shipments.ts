@@ -3,7 +3,7 @@
  * Extracts tracking information, delivery status, and shipment items.
  */
 
-import { Page } from "playwright";
+import { Locator, Page } from "playwright";
 import {
   Shipment,
   DeliveryStatus,
@@ -18,7 +18,7 @@ import {
   firstMatchingStrategy,
 } from "../../core/utils/extraction";
 import { getRegionByCode } from "../regions";
-import { extractItems } from "./items";
+import { extractItems, extractItemsFromContainer } from "./items";
 
 /**
  * Parse delivery status from text.
@@ -134,19 +134,20 @@ async function extractShipmentsStrategyA(
         delivered = parseDeliveryStatus(text || "");
       }
 
-      // Get status text from AZAD XPath
+      // Get status text from AZAD XPath. Bounded timeouts: a missing
+      // sub-element must fail fast, not burn the 30s default timeout.
       const statusText =
         (await box
           .locator(
             'xpath=.//div[contains(@class, "shipment-info-container")]//div[@class="a-row"]/span',
           )
           .first()
-          .textContent()
+          .textContent({ timeout: 1000 })
           .catch(() => "")) ||
         (await box
           .locator('[data-component="shipmentStatus"]')
           .first()
-          .textContent()
+          .textContent({ timeout: 1000 })
           .catch(() => ""));
 
       // Get tracking link using AZAD's XPaths
@@ -154,12 +155,12 @@ async function extractShipmentsStrategyA(
         (await box
           .locator('a[href*="/progress-tracker/"]')
           .first()
-          .getAttribute("href")
+          .getAttribute("href", { timeout: 1000 })
           .catch(() => "")) ||
         (await box
           .locator('a[href*="/ship-track"]')
           .first()
-          .getAttribute("href")
+          .getAttribute("href", { timeout: 1000 })
           .catch(() => ""));
 
       // Normalize tracking link
@@ -188,7 +189,7 @@ async function extractShipmentsStrategyA(
           'xpath=.//span[normalize-space(text())="Transactions"]/../../div[contains(@class, "expander")]//div[contains(@class, "a-row")]',
         )
         .first()
-        .textContent()
+        .textContent({ timeout: 1000 })
         .catch(() => "");
       if (transactionText) {
         // Parse "December 17, 2023 - Visa ending in 8489: $41.49" format
@@ -210,7 +211,7 @@ async function extractShipmentsStrategyA(
           'xpath=.//span[contains(text(), "Refund for this return")]/../../../../..//span',
         )
         .first()
-        .textContent()
+        .textContent({ timeout: 1000 })
         .catch(() => "");
       if (refundText) {
         refund = parseMoney(refundText, currency);
@@ -408,136 +409,215 @@ function validateTrackingNumber(text: string): string | null {
  * Strategy B (AZAD): 2024+ layout with data-component attributes
  * This is the primary strategy for modern Amazon pages.
  *
- * Structure from HTML:
- * - [data-component="shipments"] - main shipments container
- *   - [data-component="shipmentStatus"] - delivery status ("Arriving Tuesday", "Delivered", etc.)
- *   - [data-component="shipmentConnections"] - tracking buttons
- *     - a[href*="ship-track"] - "Track package" button with tracking URL
- *   - [data-component="purchasedItems"] - items in this shipment
+ * Structure from HTML (verified live 2026-10-17):
+ * - [data-component="shipments"] - the order's shipments container. There is
+ *   exactly ONE per order and it holds EVERY shipment group of the order
+ *   (an order with 3 shipments showed shipments=1 but shipmentsLeftGrid=3,
+ *   shipmentStatus=3, purchasedItems=3). Treating the container itself as
+ *   one shipment collapses all groups into a single bogus shipment.
+ *   - one shipment group per [data-component="shipmentStatus"]:
+ *     - [data-component="shipmentsLeftGrid"] wraps the status
+ *     - [data-component="shipmentStatus"] - delivery status text
+ *     - [data-component="shipmentConnections"] - tracking buttons
+ *       - a[href*="ship-track"] - "Track package" button with tracking URL
+ *     - [data-component="purchasedItems"] - items in this shipment
+ *
+ * Groups are located by marking, for each shipmentStatus, the highest
+ * ancestor below the shipments container that still contains only that one
+ * status (the group root), then processing each marked root with locators.
  */
+const SHIPMENT_GROUP_ATTRIBUTE = "data-mcp-shipment-group";
+
+async function markShipmentGroups(container: Locator): Promise<void> {
+  // For each shipmentStatus, its group root is the highest ancestor that
+  // still contains only that one status (ancestors spanning several groups
+  // contain 2+ statuses and are excluded by the count predicate). Marking
+  // is idempotent, so statuses sharing a root collapse to one group.
+  const statuses = await container
+    .locator('[data-component="shipmentStatus"]')
+    .all();
+  for (const status of statuses) {
+    const root = status
+      .locator(
+        'xpath=ancestor::*[count(.//*[@data-component="shipmentStatus"])=1][last()]',
+      )
+      .first();
+    if ((await root.count().catch(() => 0)) > 0) {
+      await root
+        .evaluate((el, attr) => el.setAttribute(attr, ""), SHIPMENT_GROUP_ATTRIBUTE)
+        .catch(() => {});
+    }
+  }
+}
+
 async function extractShipmentsStrategyB(
   page: Page,
   header: OrderHeader,
   items: Item[],
+  timings?: Record<string, number>,
 ): Promise<Shipment[] | null> {
-  // First try the shipments container directly
-  const shipmentsContainer = await page
-    .locator('[data-component="shipments"]')
-    .all();
+  const regionConfig = getRegionByCode(header.region);
+  const currency = regionConfig?.currency || "USD";
 
-  if (shipmentsContainer.length === 0) {
-    // Fallback: try the XPath approach
-    const shipmentBoxes = await page
+  const tContainers = Date.now();
+  const containers = await page.locator('[data-component="shipments"]').all();
+
+  const groupRoots: Locator[] = [];
+  let markingMs = 0;
+  if (containers.length > 0) {
+    for (const container of containers) {
+      const tMark = Date.now();
+      await markShipmentGroups(container);
+      markingMs += Date.now() - tMark;
+      const marked = await container
+        .locator(`[${SHIPMENT_GROUP_ATTRIBUTE}]`)
+        .all();
+      if (marked.length > 0) {
+        groupRoots.push(...marked);
+      } else {
+        // No status markers found: treat the whole container as one group.
+        groupRoots.push(container);
+      }
+    }
+  } else {
+    // Fallback: legacy XPath for group-shaped boxes (AZAD).
+    const boxes = await page
       .locator(
         'xpath=//div[div[@data-component="shipmentsLeftGrid"]/div[div[@data-component="shipmentStatus"]]]',
       )
       .all();
-    if (shipmentBoxes.length === 0) return null;
+    groupRoots.push(...boxes);
   }
+
+  if (timings) {
+    timings.b_containersMs = Date.now() - tContainers - markingMs;
+    timings.b_markingMs = markingMs;
+    timings.b_groupCount = groupRoots.length;
+  }
+
+  if (groupRoots.length === 0) return null;
 
   const shipments: Shipment[] = [];
 
-  // Each shipments container represents one shipment
-  const containers =
-    shipmentsContainer.length > 0
-      ? shipmentsContainer
-      : await page
-          .locator(
-            'xpath=//div[div[@data-component="shipmentsLeftGrid"]/div[div[@data-component="shipmentStatus"]]]',
-          )
-          .all();
-
-  for (let i = 0; i < containers.length; i++) {
-    const box = containers[i];
+  const tGroupLoop = Date.now();
+  for (let i = 0; i < groupRoots.length; i++) {
+    const group = groupRoots[i];
 
     try {
-      // Get status from data-component="shipmentStatus"
-      const statusEl = box.locator('[data-component="shipmentStatus"]').first();
+      // Status from this group's shipmentStatus component
+      const statusEl = group
+        .locator('[data-component="shipmentStatus"]')
+        .first();
       let statusText = "";
-      const statusCount = await statusEl.count().catch(() => 0);
-      if (statusCount > 0) {
-        // Get the status message text (e.g., "Arriving Tuesday")
+      if ((await statusEl.count().catch(() => 0)) > 0) {
         const statusMsgEl = statusEl
           .locator(".od-status-message, h4, .a-text-bold")
           .first();
-        statusText = (await statusMsgEl.textContent().catch(() => "")) || "";
+        statusText =
+          (await statusMsgEl
+            .textContent({ timeout: 1000 })
+            .catch(() => "")) || "";
         if (!statusText) {
-          statusText = (await statusEl.textContent().catch(() => "")) || "";
+          statusText =
+            (await statusEl.textContent({ timeout: 1000 }).catch(() => "")) ||
+            "";
         }
       }
-      const delivered = parseDeliveryStatus(statusText || "");
+      statusText = statusText.replace(/\s+/g, " ").trim();
 
-      // Get tracking link from shipmentConnections or any tracking link
+      const groupText =
+        (await group.textContent({ timeout: 1000 }).catch(() => "")) || "";
+      const delivered = parseDeliveryStatus(statusText || groupText);
+
+      // Tracking link scoped to this group
       let trackingLink = "";
-
-      // Primary: look in shipmentConnections for "Track package" button
-      const trackBtn = box
+      const trackBtn = group
         .locator(
           '[data-component="shipmentConnections"] a[href*="ship-track"], a[href*="ship-track"]',
         )
         .first();
-      const trackBtnCount = await trackBtn.count().catch(() => 0);
-      if (trackBtnCount > 0) {
+      if ((await trackBtn.count().catch(() => 0)) > 0) {
         trackingLink =
-          (await trackBtn.getAttribute("href").catch(() => "")) || "";
-      }
-
-      // Fallback: look for progress-tracker links
-      if (!trackingLink) {
-        trackingLink =
-          (await box
-            .locator('a[href*="/progress-tracker/"]')
-            .first()
-            .getAttribute("href")
+          (await trackBtn
+            .getAttribute("href", { timeout: 1000 })
             .catch(() => "")) || "";
       }
-
-      // Normalize tracking link
+      if (!trackingLink) {
+        // No anchor tracking link in this group is common (the track
+        // button is often JS-driven). This read MUST stay bounded: on an
+        // empty locator an unbounded getAttribute waits the full 30s
+        // default timeout — per group.
+        trackingLink =
+          (await group
+            .locator('a[href*="/progress-tracker/"]')
+            .first()
+            .getAttribute("href", { timeout: 1000 })
+            .catch(() => "")) || "";
+      }
       if (trackingLink && !trackingLink.startsWith("http")) {
         trackingLink = `https://www.${getRegionByCode(header.region)?.domain}${trackingLink}`;
       }
 
-      // Extract shipment ID from tracking link
       let shipmentId = `${header.orderId}-shipment-${i + 1}`;
       if (trackingLink) {
         const shipmentMatch = trackingLink.match(/shipmentId=([^&]+)/);
         if (shipmentMatch) shipmentId = shipmentMatch[1];
       }
-
-      // Extract tracking ID
       const trackingIdMatch = trackingLink?.match(/trackingId=([^&]+)/);
       const trackingId = trackingIdMatch ? trackingIdMatch[1] : "";
 
-      // Count items in this shipment from purchasedItems containers
-      const shipmentPurchasedItems = await box
+      // Items belonging to this group, from its own purchasedItems blocks
+      const purchasedContainers = await group
         .locator('[data-component="purchasedItems"]')
         .all();
-      const itemCount = shipmentPurchasedItems.length;
-
-      // Associate items with shipments (first shipment gets all items if only one shipment)
-      const shipmentItems =
-        containers.length === 1
-          ? items
-          : i === 0
-            ? items.slice(0, itemCount || items.length)
-            : [];
+      let groupItems: Item[] = [];
+      for (const purchased of purchasedContainers) {
+        groupItems.push(
+          ...(await extractItemsFromContainer(purchased, header, currency)),
+        );
+      }
+      if (groupItems.length === 0 && groupRoots.length === 1) {
+        groupItems = items;
+      }
 
       shipments.push({
         shipmentId,
         orderHeader: header,
-        items: shipmentItems,
+        items: groupItems,
         delivered,
-        status: statusText?.trim() || "Unknown",
+        status: statusText || "Unknown",
         trackingLink: trackingLink || "",
         trackingId,
-        platformData: { itemCount },
+        platformData: { itemCount: purchasedContainers.length },
       });
     } catch {
       continue;
     }
   }
+  if (timings) timings.b_groupLoopMs = Date.now() - tGroupLoop;
 
-  return shipments.length > 0 ? shipments : null;
+  if (shipments.length === 0) return null;
+
+  // Grouping produced no items at all although the order has items: the
+  // group detection misfired on an unexpected layout. Fall back to a
+  // single shipment carrying all items rather than losing them.
+  const totalGroupItems = shipments.reduce((n, s) => n + s.items.length, 0);
+  if (totalGroupItems === 0 && items.length > 0) {
+    return [
+      {
+        shipmentId: `${header.orderId}-shipment-1`,
+        orderHeader: header,
+        items,
+        delivered: shipments[0].delivered,
+        status: shipments[0].status,
+        trackingLink: shipments[0].trackingLink,
+        trackingId: shipments[0].trackingId,
+        platformData: {},
+      },
+    ];
+  }
+
+  return shipments;
 }
 
 /**
@@ -567,7 +647,7 @@ async function extractShipmentsStrategy1(
         (await section
           .locator('a[href*="track"]')
           .first()
-          .getAttribute("href")
+          .getAttribute("href", { timeout: 1000 })
           .catch(() => "")) || "";
       const trackingIdMatch = trackingLink.match(/trackingId=([^&]+)/i);
       const trackingId = trackingIdMatch ? trackingIdMatch[1] : "";
@@ -613,7 +693,7 @@ async function extractShipmentsStrategy2(
       const statusText = await section
         .locator('.a-color-success, .a-color-state, [class*="status"]')
         .first()
-        .textContent()
+        .textContent({ timeout: 1000 })
         .catch(() => "");
       const delivered = parseDeliveryStatus(statusText || "");
 
@@ -622,7 +702,7 @@ async function extractShipmentsStrategy2(
         (await section
           .locator('a[href*="track"]')
           .first()
-          .getAttribute("href")
+          .getAttribute("href", { timeout: 1000 })
           .catch(() => "")) || "";
       let trackingId = "";
 
@@ -630,7 +710,7 @@ async function extractShipmentsStrategy2(
       const trackingNumText = await section
         .locator(':text-matches("\\\\d{10,}")')
         .first()
-        .textContent()
+        .textContent({ timeout: 1000 })
         .catch(() => "");
       if (trackingNumText) {
         const match = trackingNumText.match(/\d{10,}/);
@@ -702,6 +782,19 @@ async function extractShipmentsStrategy3(
 export interface ExtractShipmentsOptions {
   /** Visit ship-track pages to get actual carrier tracking numbers (slower but complete) */
   fetchTrackingNumbers?: boolean;
+  /**
+   * Items already extracted for this order by the caller. When provided,
+   * the extractor does not run its own item extraction pass (callers such
+   * as fetchOrders have usually just extracted the same items from the
+   * invoice or detail page, and re-extracting them doubles the work).
+   */
+  items?: Item[];
+  /**
+   * Optional out-param: filled with the duration (ms) of each shipment
+   * strategy attempted, keyed by strategy name. Strategies after the
+   * first successful one do not run and get no entry.
+   */
+  strategyTimings?: Record<string, number>;
 }
 
 /**
@@ -714,17 +807,38 @@ export async function extractShipments(
 ): Promise<Shipment[]> {
   const { fetchTrackingNumbers = false } = options;
 
-  // First, extract items for this order
-  const items = await extractItems(page, header);
+  // Use caller-provided items when available; extract only as a fallback.
+  let items = options.items;
+  if (!items) {
+    const tItems = Date.now();
+    items = await extractItems(page, header);
+    const ms = Date.now() - tItems;
+    if (options.strategyTimings) options.strategyTimings.itemsMs = ms;
+    console.error(`[shipments][timing] itemsExtraction: ${ms}ms`);
+  }
 
-  // Try each extraction strategy (AZAD order: A, B, then fallbacks)
+  // Try each extraction strategy (AZAD order: A, B, then fallbacks),
+  // timing each attempt so slow stages are visible in the server log.
+  const timed = async (
+    name: string,
+    fn: () => Promise<Shipment[] | null>,
+  ): Promise<Shipment[] | null> => {
+    const start = Date.now();
+    try {
+      return await fn();
+    } finally {
+      const ms = Date.now() - start;
+      if (options.strategyTimings) options.strategyTimings[name] = ms;
+      console.error(`[shipments][timing] ${name}: ${ms}ms`);
+    }
+  };
   const shipments = await firstMatchingStrategy<Shipment[]>(
     [
-      () => extractShipmentsStrategyA(page, header, items), // AZAD's a-box.shipment
-      () => extractShipmentsStrategyB(page, header, items), // AZAD's data-component 2024+
-      () => extractShipmentsStrategy2(page, header, items), // Delivery status sections
-      () => extractShipmentsStrategy1(page, header, items), // Tracking sections
-      () => extractShipmentsStrategy3(page, header, items), // Fallback single shipment
+      () => timed("strategyA", () => extractShipmentsStrategyA(page, header, items)), // AZAD's a-box.shipment
+      () => timed("strategyB", () => extractShipmentsStrategyB(page, header, items, options.strategyTimings)), // AZAD's data-component 2024+
+      () => timed("strategy2", () => extractShipmentsStrategy2(page, header, items)), // Delivery status sections
+      () => timed("strategy1", () => extractShipmentsStrategy1(page, header, items)), // Tracking sections
+      () => timed("strategy3", () => extractShipmentsStrategy3(page, header, items)), // Fallback single shipment
     ],
     [],
   );
