@@ -168,6 +168,52 @@ async function getPage(): Promise<Page> {
 }
 
 /**
+ * Run a function against a throwaway page in the shared browser context.
+ * The deploy-only generic browsing tools use this so they share the
+ * persistent profile's cookies and logins without ever navigating the
+ * shared page the Amazon tools depend on. The page is always closed
+ * afterwards, even when the function throws.
+ */
+async function withBrowsePage<T>(
+  fn: (browsePage: Page) => Promise<T>,
+): Promise<T> {
+  const context = await getBrowserContext();
+  const browsePage = await context.newPage();
+  try {
+    return await fn(browsePage);
+  } finally {
+    await browsePage.close().catch(() => {});
+  }
+}
+
+/**
+ * Return the URL when it is an absolute http(s) URL, otherwise null.
+ */
+function validateBrowseUrl(url: string | undefined): string | null {
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  return url;
+}
+
+/**
+ * Load a URL on a browse page and let it settle: DOM content loaded, a
+ * short best-effort network-idle wait, then an optional extra wait.
+ */
+async function loadBrowsePage(
+  browsePage: Page,
+  url: string,
+  waitMs: number,
+): Promise<void> {
+  await browsePage.goto(url, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000,
+  });
+  await browsePage
+    .waitForLoadState("networkidle", { timeout: 5000 })
+    .catch(() => {});
+  if (waitMs > 0) await browsePage.waitForTimeout(waitMs);
+}
+
+/**
  * Validate region parameter and return error response if invalid.
  */
 function validateRegion(
@@ -726,6 +772,60 @@ const tools: Tool[] = [
       required: ["region"],
     },
   },
+  {
+    name: "browse_fetch",
+    description:
+      "Deploy-only generic browsing: fetch any http(s) URL in the server's persistent Chromium profile (home IP, existing logins) and return the final URL, page title, and visible text. Uses a throwaway page in the shared browser context and closes it afterwards, so it never disturbs the Amazon tools' shared page. Read-only: loads the page but clicks and types nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "Absolute http(s) URL to load",
+        },
+        wait_ms: {
+          type: "number",
+          description:
+            "Extra settle wait after load, in milliseconds (0-15000). Default: 0.",
+          default: 0,
+        },
+        max_chars: {
+          type: "number",
+          description:
+            "Maximum characters of page text to return (1000-60000). Default: 20000.",
+          default: 20000,
+        },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "browse_screenshot",
+    description:
+      "Deploy-only generic browsing: load any http(s) URL in the server's persistent Chromium profile (home IP, existing logins) and return a PNG screenshot as an image, plus the final URL and title as text. Uses a throwaway page in the shared browser context and closes it afterwards, so it never disturbs the Amazon tools' shared page. Read-only: loads the page but clicks and types nothing.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "Absolute http(s) URL to load",
+        },
+        wait_ms: {
+          type: "number",
+          description:
+            "Extra settle wait after load, in milliseconds (0-15000). Default: 0.",
+          default: 0,
+        },
+        full_page: {
+          type: "boolean",
+          description:
+            "Capture the full scrollable page instead of just the viewport. Default: false.",
+          default: false,
+        },
+      },
+      required: ["url"],
+    },
+  },
 ];
 
 // Create server instance
@@ -1037,7 +1137,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 async function handleToolCall(request: CallToolRequest): Promise<{
-  content: Array<{ type: string; text: string }>;
+  content: Array<{
+    type: string;
+    text?: string;
+    data?: string;
+    mimeType?: string;
+  }>;
   isError?: boolean;
 }> {
   const { name, arguments: args } = request.params;
@@ -2637,6 +2742,115 @@ async function handleToolCall(request: CallToolRequest): Promise<{
                   stimulator,
                   requests: capturedRequests,
                   responses: capturedResponses,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      case "browse_fetch": {
+        const url = validateBrowseUrl(args?.url as string | undefined);
+        if (!url) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  status: "error",
+                  error: "url must be an absolute http(s) URL",
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        const waitMs = Math.min(
+          Math.max((args?.wait_ms as number | undefined) ?? 0, 0),
+          15000,
+        );
+        const maxChars = Math.min(
+          Math.max((args?.max_chars as number | undefined) ?? 20000, 1000),
+          60000,
+        );
+        const result = await withBrowsePage(async (browsePage) => {
+          await loadBrowsePage(browsePage, url, waitMs);
+          const title = await browsePage.title();
+          const fullText = await browsePage.evaluate(() => {
+            const browserWindow = globalThis as unknown as {
+              document: { body?: { innerText?: string } };
+            };
+            return browserWindow.document.body?.innerText ?? "";
+          });
+          return {
+            finalUrl: browsePage.url(),
+            title,
+            text: fullText.slice(0, maxChars),
+            truncated: fullText.length > maxChars,
+            textLength: fullText.length,
+          };
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { status: "success", params: { url }, ...result },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      }
+
+      case "browse_screenshot": {
+        const url = validateBrowseUrl(args?.url as string | undefined);
+        if (!url) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  status: "error",
+                  error: "url must be an absolute http(s) URL",
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        const waitMs = Math.min(
+          Math.max((args?.wait_ms as number | undefined) ?? 0, 0),
+          15000,
+        );
+        const fullPage = (args?.full_page as boolean | undefined) ?? false;
+        const shot = await withBrowsePage(async (browsePage) => {
+          await loadBrowsePage(browsePage, url, waitMs);
+          const title = await browsePage.title();
+          const buffer = await browsePage.screenshot({
+            type: "png",
+            fullPage,
+          });
+          return {
+            finalUrl: browsePage.url(),
+            title,
+            data: buffer.toString("base64"),
+          };
+        });
+        return {
+          content: [
+            { type: "image", data: shot.data, mimeType: "image/png" },
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  status: "success",
+                  params: { url },
+                  finalUrl: shot.finalUrl,
+                  title: shot.title,
                 },
                 null,
                 2,
