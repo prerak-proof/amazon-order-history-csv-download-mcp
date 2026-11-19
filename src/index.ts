@@ -1106,9 +1106,28 @@ async function refreshCode(): Promise<{
     };
   }
 
-  // Let the response flush, then exit so the container restarts onto the
-  // new build (start.sh re-fetches, which is a no-op, and launches it).
-  setTimeout(() => process.exit(0), 2000).unref();
+  // Let the response flush, then close the browser gracefully before
+  // exiting so the container restarts onto the new build (start.sh
+  // re-fetches, which is a no-op, and launches it). An abrupt
+  // process.exit leaves Chromium's profile exit flag "crashed"; the
+  // close is bounded so a stuck shutdown cannot wedge the restart.
+  setTimeout(() => {
+    void (async () => {
+      try {
+        if (browserContext) {
+          await Promise.race([
+            browserContext.close(),
+            new Promise<void>((resolve) => {
+              setTimeout(resolve, 15000).unref();
+            }),
+          ]);
+        }
+      } catch {
+        // Browser already gone; exit regardless.
+      }
+      process.exit(0);
+    })();
+  }, 2000).unref();
 
   return {
     status: "updated",
