@@ -76,6 +76,31 @@ Once configured, you can ask your AI assistant:
 - "What's my Amazon gift card balance?"
 - "Show me all my Amazon transactions from last month"
 
+## Synology deployment branch
+
+`deploy/synology-streamable-http` is stacked on
+`fix/date-bounded-pagination-and-item-titles`. Its PR targets that branch in this
+fork. The base remains the candidate for upstream submission; this branch adds
+the deployment behavior used by the Synology containers.
+
+The default transport on this branch is Streamable HTTP. Set `MCP_TRANSPORT=stdio`
+to keep using a stdio client. HTTP settings are `MCP_HOST` (default `0.0.0.0`),
+`MCP_PORT` (`8000`), and `MCP_PATH` (`/mcp`). `GET /healthz` reports server health.
+HTTP uses stateless MCP transport so clients can connect independently.
+
+Chromium uses `AMAZON_BROWSER_CHANNEL` (default `chromium`) and
+`AMAZON_BROWSER_HEADLESS` (default `true`). Set headless to `false` for interactive
+login under the deployment's Xvfb/noVNC display. Both modes reuse the persistent
+profile selected by `AMAZON_ORDERS_BROWSER_DATA_DIR`; the obsolete hard-coded
+Chrome/macOS User-Agent has been removed. The base's configurable browser idle
+timeout applies in both modes.
+
+After building, `node tests/deployment-http.mjs dist/index.js` checks the HTTP
+endpoint with two client initializations, without contacting Amazon.
+
+When the base gains commits, merge it into this branch and push. This branch
+contains ready-to-build source; no startup-time patch script is needed.
+
 ## Supported Regions
 
 | Region         | Domain        | Currency |
